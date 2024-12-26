@@ -2,8 +2,7 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
-import sys
-import os
+import io
 
 # =====================================
 #            FUNZIONI DI BASE
@@ -70,10 +69,10 @@ def compute_stochastic(high, low, close, k_period=14, d_period=3):
 def compute_macd(close, fastperiod=12, slowperiod=26, signalperiod=9):
     ema_fast = close.ewm(span=fastperiod, adjust=False).mean()
     ema_slow = close.ewm(span=slowperiod, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    signal = macd.ewm(span=signalperiod, adjust=False).mean()
-    hist = macd - signal
-    return macd, signal, hist
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signalperiod, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
 # ======================
 #  FIBONACCI & OVERSOLD
@@ -81,7 +80,7 @@ def compute_macd(close, fastperiod=12, slowperiod=26, signalperiod=9):
 def fibonacci_level(df, retracement=0.618):
     """
     Calcola il livello di Fibonacci personalizzato
-    (ad es. retracement=0.618 => 61,8%).
+    (es. retracement=0.618 => 61,8%).
     """
     if df.empty:
         return None
@@ -172,12 +171,6 @@ def fibonacci_retracement_screener(
     results = []
 
     for ticker in tickers:
-        # Prima di ogni elaborazione, verifichiamo se l'utente ha premuto "Stop"
-        # nel frattempo (vedi implementazione nella funzione main).
-        if "stop_screener" in st.session_state and st.session_state["stop_screener"]:
-            # Facciamo un return immediato con dataframe vuoto
-            return pd.DataFrame()
-
         try:
             if single_ticker:
                 df_ticker = data
@@ -245,23 +238,8 @@ def fibonacci_retracement_screener(
 #         STREAMLIT
 # ======================
 def main():
-    st.title("Fibonacci Screener (livello personalizzato) + Oversold Filters + STOP")
-    st.write("**Ottimizzato per ridurre le richieste a yfinance.**")
-
-    # Inizializziamo la variabile di sessione per lo stop, se non esiste
-    if "stop_screener" not in st.session_state:
-        st.session_state["stop_screener"] = False
-
-    # Se l'utente preme "Stop Screener"
-    if st.button("Stop Screener"):
-        st.warning("Screener was forcibly stopped. Exiting...")
-        # 1) Impostiamo un flag di sessione
-        st.session_state["stop_screener"] = True
-        # 2) Se vogliamo proprio fermare il process Python, usiamo sys.exit()
-        #    o os._exit(0). Questo causerà un errore "Application disconnected"
-        #    in Streamlit, terminando l'app.
-        # sys.exit("User requested exit")
-        os._exit(0)  # forza la chiusura immediata del processo
+    st.title("Fibonacci Screener + Oversold Filters + Export to TradingView Watchlist")
+    st.write("**Ottimizzato per ridurre le richieste a yfinance**")
 
     # Parametri input
     min_market_cap = st.number_input("Minimum Market Cap (USD)", value=10_000_000_000, step=1_000_000_000)
@@ -280,9 +258,6 @@ def main():
     macd_flag = st.checkbox("MACD < 0 e MACD < Signal", value=True)
 
     if st.button("Esegui Screener"):
-        # Prima di iniziare, azzeriamo l'eventuale stop
-        st.session_state["stop_screener"] = False
-
         st.write("1) Recupero lista S&P 500...")
         sp500_df = get_sp500_companies()
         if sp500_df.empty:
@@ -291,7 +266,7 @@ def main():
         
         # Pulizia ticker
         tickers = sp500_df['Symbol'].tolist()
-        tickers = [t.replace('.', '-') for t in tickers]
+        tickers = [t.replace('.', '-') for t in tickers]  # yfinance usa i trattini
 
         st.write(f"2) Filtro per Market Cap >= {min_market_cap} ...")
         filtered_tickers = filter_stocks_by_market_cap(tickers, min_market_cap)
@@ -309,17 +284,37 @@ def main():
             check_macd=macd_flag
         )
 
-        # Se l'utente ha premuto Stop durante l'esecuzione, results_df sarà vuoto
-        if st.session_state["stop_screener"]:
-            st.warning("Lo screener è stato interrotto prima del completamento.")
-            return
-
         if results_df.empty:
             st.info("Nessun titolo soddisfa i criteri (Fib vicino + oversold richiesti).")
         else:
             st.success(f"Trovati {len(results_df)} titoli:")
             st.dataframe(results_df)
 
+            # ==========================
+            #    EXPORT TICKERS
+            # ==========================
+            st.write("### Esporta Tickers per TradingView")
+
+            # 1) Creiamo la lista di ticker
+            watchlist_tickers = results_df['Ticker'].tolist()
+
+            # 2) Generiamo un CSV/txt in memoria
+            csv_buffer = io.StringIO()
+            # TradingView in genere riconosce un ticker per riga, ad es. "AAPL"
+            for t in watchlist_tickers:
+                csv_buffer.write(t + "\n")
+
+            csv_data = csv_buffer.getvalue()
+
+            # 3) Permettiamo di scaricarlo
+            st.download_button(
+                label="Scarica la Watchlist (txt)",
+                data=csv_data,
+                file_name="my_tradingview_watchlist.txt",
+                mime="text/plain"
+            )
+
+            st.info("Dopo il download, su TradingView > Watchlist > Import, seleziona il file .txt con i ticker.")
 
 if __name__ == "__main__":
     main()
