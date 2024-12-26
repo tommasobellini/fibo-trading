@@ -10,9 +10,6 @@ import io
 
 @st.cache_data
 def get_sp500_companies():
-    """
-    Recupera la lista delle aziende S&P 500 da Wikipedia.
-    """
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     tables = pd.read_html(url)
     df = tables[0]
@@ -20,10 +17,6 @@ def get_sp500_companies():
 
 @st.cache_data
 def get_market_caps_bulk(tickers):
-    """
-    Recupera in blocco i Market Cap dei ticker, usando yf.Tickers(...)
-    invece di invocare Ticker(t).info per ognuno.
-    """
     joined_tickers = " ".join(tickers)
     bulk_obj = yf.Tickers(joined_tickers)
     caps = {}
@@ -36,42 +29,21 @@ def get_market_caps_bulk(tickers):
     return caps
 
 def filter_stocks_by_market_cap(tickers, min_market_cap=10_000_000_000):
-    """
-    Filtra i ticker in base alla capitalizzazione di mercato.
-    """
     caps_dict = get_market_caps_bulk(tickers)
     filtered = [t for t in tickers if caps_dict.get(t, 0) >= min_market_cap]
     return filtered
 
-############################
-# Trova max/min "precedenti"
-############################
 def find_previous_swing_points(df, exclude_days=5):
-    """
-    Cerca il "massimo precedente" e il "minimo precedente" in df,
-    ignorando (escludendo) gli ultimi `exclude_days` giorni.
-    Restituisce (max_price, min_price).
-    """
     if len(df) < exclude_days + 2:
         return None, None
-    
-    # Escludiamo gli ultimi N giorni
     df_past = df.iloc[:-exclude_days]
     if df_past.empty:
         return None, None
-    
     max_price = df_past['High'].max()
     min_price = df_past['Low'].min()
     return max_price, min_price
 
-############################
-# Livelli di Fibonacci
-############################
 def compute_fibonacci_levels(max_price, min_price):
-    """
-    Calcolo classico del retracement:
-    0% = max_price, 100% = min_price (dall'alto al basso).
-    """
     if max_price is None or min_price is None:
         return {}
     diff = max_price - min_price
@@ -87,144 +59,160 @@ def compute_fibonacci_levels(max_price, min_price):
     return levels
 
 def is_near_level(current_price, target_price, tolerance=0.01):
-    """
-    Verifica se current_price è vicino a target_price
-    con una tolleranza percentuale (default 1%).
-    """
     if target_price == 0:
         return False
     return abs(current_price - target_price) / abs(target_price) <= tolerance
 
+############################
+# Indicatori "oversold"
+############################
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta>0, 0.0)
+    loss = -delta.where(delta<0, 0.0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100/(1+rs))
+    return rsi
+
+def compute_stochastic(high, low, close, k_period=14, d_period=3):
+    lowest_low = low.rolling(k_period).min()
+    highest_high = high.rolling(k_period).max()
+    stoch_k = 100 * (close - lowest_low) / (highest_high - lowest_low)
+    stoch_d = stoch_k.rolling(d_period).mean()
+    return stoch_k, stoch_d
+
+def compute_macd(close, fastperiod=12, slowperiod=26, signalperiod=9):
+    ema_fast = close.ewm(span=fastperiod, adjust=False).mean()
+    ema_slow = close.ewm(span=slowperiod, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signalperiod, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def is_oversold(rsi_val, stoch_k_val, macd_val, signal_val,
+                check_rsi=True, check_stoch=True, check_macd=True):
+    # RSI oversold: rsi < 30
+    # Stoch oversold: stoch_k < 20
+    # MACD oversold: macd < 0 e macd < signal
+    if check_rsi and rsi_val >= 30:
+        return False
+    if check_stoch and stoch_k_val >= 20:
+        return False
+    if check_macd and (macd_val >= 0 or macd_val >= signal_val):
+        return False
+    return True
 
 ############################
-# Stagionalità su 10 anni
+# Funzione di "entry & stop"
 ############################
-@st.cache_data
-def compute_seasonality_10y(ticker):
+def define_trade_levels(current_price, min_price):
     """
-    Calcola la stagionalità rispetto allo stesso mese
-    negli ultimi 10 anni.
-    
-    - Scarica 10 anni di dati daily.
-    - Per ogni mese (1..12), calcola la performance media storica.
-    - Calcola la performance (somma daily_return) del mese corrente.
-    - Restituisce: differenza (mese_corrente - media_storica_mese) * 100
-      in punti percentuali.
-    
-    Se mancano dati o non possiamo calcolare, restituisce None.
+    Esempio: 
+      - Entry Price = current_price (ipotizziamo ingresso immediato)
+      - Stop Price = 1% sotto il min_price (lo swing low precedente),
+        così se il mercato rompe quel minimo, esce in stop.
     """
-    end = datetime.now()
-    start = end - timedelta(days=365 * 10)  # 10 anni
-
-    try:
-        df = yf.download(ticker, start=start, end=end, interval="1d")
-    except Exception as e:
-        st.warning(f"Error downloading data for {ticker}: {e}")
-        return None
-    
-    if df.empty:
-        return None
-    
-    df['Month'] = df.index.month
-    df['Year'] = df.index.year
-
-    # Rendimento giornaliero
-    df['Daily_Return'] = df['Close'].pct_change()
-
-    # Raggruppiamo Year, Month → somma daily_return
-    monthly = df.groupby(['Year','Month'])['Daily_Return'].sum().reset_index()
-    
-    # Media storica per ogni mese (1..12)
-    monthly_avg = monthly.groupby('Month')['Daily_Return'].mean()
-
-    current_year = end.year
-    current_month = end.month
-    
-    # Trova la performance del mese attuale
-    row_current = monthly[(monthly['Year'] == current_year) & (monthly['Month'] == current_month)]
-    if row_current.empty:
-        # Se il mese non è finito, facciamo partial:
-        df_this_month = df[(df.index.year == current_year) & (df.index.month == current_month)]
-        if df_this_month.empty:
-            return None
-        actual_return = df_this_month['Daily_Return'].sum()
-    else:
-        actual_return = row_current['Daily_Return'].iloc[0]
-
-    if current_month not in monthly_avg.index:
-        return None
-    
-    avg_return = monthly_avg.loc[current_month]
-
-    diff = (actual_return - avg_return) * 100.0
-    return diff  # ex: +2.5 => 2,5% sopra la media storica del mese
-
+    entry_price = current_price
+    stop_price = min_price * 0.99  # 1% sotto
+    return round(entry_price, 2), round(stop_price, 2)
 
 ############################
 # Screener principale
 ############################
-def fibonacci_screener_previous_swings(tickers, exclude_days=5):
+def fibonacci_screener_entry_stop(
+    tickers, exclude_days=5, 
+    check_rsi=True, check_stoch=True, check_macd=True
+):
     """
-    1) Scarica 6 mesi di dati.
-    2) Trova max e min "precedenti" escludendo ultimi exclude_days giorni.
-    3) Calcola i livelli Fib, controlla se l'ultimo prezzo è vicino a 61,8%.
-    4) Determina bull/bear.
-    Restituisce un DataFrame con i titoli che rispettano la condizione.
+    1) Scarica 6 mesi di dati
+    2) Trova swing max/min precedenti (escludendo ultimi exclude_days)
+    3) Se prezzo attuale è vicino al fib 61,8% e oversold:
+       - Definisce entry e stop
     """
     end = datetime.now()
-    start = end - timedelta(days=6*30)  # ~6 mesi
-    
-    try:
-        data = yf.download(tickers, start=start, end=end, group_by="ticker")
-    except Exception as e:
-        st.warning(f"Error downloading data in bulk: {e}")
-        return pd.DataFrame()
+    start = end - timedelta(days=6*30)
 
+    data = yf.download(tickers, start=start, end=end, group_by="ticker")
     single_ticker = (len(tickers) == 1)
     results = []
-
-    # Interessati di default al 61,8% (puoi aggiungere altri se vuoi)
-    selected_levels = ['61.8%']
-    tolerance = 0.01  # 1%
 
     for ticker in tickers:
         try:
             if single_ticker:
                 df_ticker = data
             else:
-                # MultiIndex
                 if ticker not in data.columns.levels[0]:
                     continue
                 df_ticker = data[ticker]
-            
+
             if df_ticker.empty:
                 continue
-
-            # Trova swing prev
+            
+            # Trova swing
             max_price, min_price = find_previous_swing_points(df_ticker, exclude_days=exclude_days)
             if max_price is None or min_price is None:
                 continue
-            
             fib_levels = compute_fibonacci_levels(max_price, min_price)
             if not fib_levels:
                 continue
 
             current_price = df_ticker['Close'].iloc[-1]
 
-            for lvl_name in selected_levels:
-                lvl_price = fib_levels[lvl_name]
-                if is_near_level(current_price, lvl_price, tolerance=tolerance):
-                    # Bullish o Bearish?
-                    fib_trend = "Bullish" if (current_price >= lvl_price) else "Bearish"
+            # Calcolo indicatori
+            close_series = df_ticker['Close']
+            high_series = df_ticker['High']
+            low_series = df_ticker['Low']
+
+            rsi_series = compute_rsi(close_series, period=14)
+            if rsi_series.dropna().empty:
+                continue
+            rsi_val = rsi_series.iloc[-1]
+
+            stoch_k, stoch_d = compute_stochastic(high_series, low_series, close_series)
+            if stoch_k.dropna().empty:
+                continue
+            stoch_k_val = stoch_k.iloc[-1]
+
+            macd_line, signal_line, _ = compute_macd(close_series)
+            if macd_line.dropna().empty:
+                continue
+            macd_val = macd_line.iloc[-1]
+            signal_val = signal_line.iloc[-1]
+
+            # Scegliamo di controllare solo 61.8% per esempio
+            fib_618 = fib_levels['61.8%']
+            # Se prezzo attuale è vicino al 61,8% e "oversold" 
+            if is_near_level(current_price, fib_618, tolerance=0.01):
+                # Bullish/Bearish
+                if current_price >= fib_618:
+                    fib_trend = "Bullish"
+                else:
+                    fib_trend = "Bearish"
+
+                # Check oversold
+                if is_oversold(rsi_val, stoch_k_val, macd_val, signal_val,
+                               check_rsi, check_stoch, check_macd):
+                    # Definiamo Entry e Stop
+                    entry_price, stop_price = define_trade_levels(current_price, min_price)
+
                     results.append({
                         'Ticker': ticker,
                         'Max Price (prev.)': round(max_price, 2),
                         'Min Price (prev.)': round(min_price, 2),
-                        'Fib Level': lvl_name,
-                        'Level Price': round(lvl_price, 2),
+                        'Fib 61.8%': round(fib_618, 2),
                         'Current Price': round(current_price, 2),
                         'Fib Trend': fib_trend,
+                        'RSI': round(rsi_val, 2),
+                        'StochK': round(stoch_k_val, 2),
+                        'MACD': round(macd_val, 2),
+                        'Signal': round(signal_val, 2),
+                        # Nuove colonne
+                        'Entry Price': entry_price,
+                        'Stop Price': stop_price
                     })
+
         except Exception as e:
             st.warning(f"Errore su {ticker}: {e}")
             continue
@@ -233,75 +221,58 @@ def fibonacci_screener_previous_swings(tickers, exclude_days=5):
 
 
 ############################
-# App Streamlit
+# App Streamlit di esempio
 ############################
 def main():
-    st.title("Fibonacci Screener (massimi/minimi precedenti) + Stagionalità 10y")
+    st.title("Fibonacci Screener + RSI/Stoch/MACD + Entry & Stop")
 
-    min_mcap = st.number_input("Min Market Cap (USD)", value=10_000_000_000, step=1_000_000_000)
-    exclude_days = st.number_input("Escludi ultimi N giorni per trovare max/min precedente", value=5, step=1)
+    min_market_cap = st.number_input("Min Market Cap", value=10_000_000_000, step=1_000_000_000)
+    exclude_days = st.number_input("Escludi ultimi N giorni (swing precedenti)", value=5, step=1)
+    
+    # Flag oversold
+    rsi_flag = st.checkbox("RSI < 30", value=True)
+    stoch_flag = st.checkbox("Stocastico < 20", value=True)
+    macd_flag = st.checkbox("MACD < 0 e MACD < Signal", value=True)
 
     if st.button("Esegui Screener"):
-        # 1) Lista S&P500
         sp500_df = get_sp500_companies()
         if sp500_df.empty:
             st.error("Impossibile scaricare la lista S&P 500.")
             return
         
-        # Pulizia ticker
         tickers = sp500_df['Symbol'].tolist()
         tickers = [t.replace('.', '-') for t in tickers]
 
-        # 2) Filtro
-        filtered_tickers = filter_stocks_by_market_cap(tickers, min_mcap)
-        st.write("Ticker dopo filtro:", len(filtered_tickers))
-        if not filtered_tickers:
+        filtered = filter_stocks_by_market_cap(tickers, min_market_cap)
+        st.write("Ticker dopo filtro:", len(filtered))
+        if not filtered:
             st.warning("Nessun ticker supera la capitalizzazione richiesta.")
             return
 
-        # 3) Screener fib
-        df_results = fibonacci_screener_previous_swings(filtered_tickers, exclude_days=exclude_days)
-        if df_results.empty:
-            st.info("Nessun titolo si trova vicino al livello Fib 61.8% (precedente swing).")
-            return
-
-        st.success(f"Troviamo {len(df_results)} titoli. Calcoliamo la Stagionalità (10 anni)...")
-
-        # 4) Calcolo stagionalità 10y
-        seasonality_scores = []
-        for t in df_results['Ticker']:
-            score = compute_seasonality_10y(t)
-            if score is None:
-                seasonality_scores.append(None)
-            else:
-                # round a due decimali
-                seasonality_scores.append(round(score, 2))
-
-        df_results['Seasonality (10y)'] = seasonality_scores
-
-        st.write("""
-        - **Fib Trend**: 'Bullish' se prezzo >= livello 61,8%, 'Bearish' se < livello.
-        - **Seasonality (10y)**: differenza (in %) tra la performance di questo mese e la media storica
-          dello stesso mese, calcolata sugli ultimi 10 anni.
-          Esempio: +2.5 => il titolo sta rendendo 2.5 punti percentuali in più rispetto
-          alla sua media storica del mese.
-        """)
-
-        st.dataframe(df_results)
-
-        # Opzionale: esporta
-        watchlist_tickers = df_results['Ticker'].tolist()
-        csv_buffer = io.StringIO()
-        for t in watchlist_tickers:
-            csv_buffer.write(t + "\n")
-        csv_data = csv_buffer.getvalue()
-
-        st.download_button(
-            label="Scarica Tickers",
-            data=csv_data,
-            file_name="my_fibonacci_watchlist.txt",
-            mime="text/plain"
+        df_results = fibonacci_screener_entry_stop(
+            filtered, exclude_days=exclude_days, 
+            check_rsi=rsi_flag, check_stoch=stoch_flag, check_macd=macd_flag
         )
+
+        if df_results.empty:
+            st.info("Nessun titolo rispetta i criteri (vicino a Fib 61.8%, oversold).")
+        else:
+            st.success(f"Trovati {len(df_results)} titoli. Mostriamo entry e stop proposti:")
+            st.dataframe(df_results)
+
+            # Export
+            watchlist = df_results['Ticker'].tolist()
+            csv_buffer = io.StringIO()
+            for t in watchlist:
+                csv_buffer.write(t + "\n")
+            csv_data = csv_buffer.getvalue()
+
+            st.download_button(
+                label="Scarica Tickers",
+                data=csv_data,
+                file_name="my_watchlist_fib.txt",
+                mime="text/plain"
+            )
 
 if __name__ == "__main__":
     main()
