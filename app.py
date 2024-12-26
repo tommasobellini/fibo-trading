@@ -3,6 +3,7 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
 import io
+import numpy as np
 
 # =====================================
 #            FUNZIONI DI BASE
@@ -121,7 +122,7 @@ def meets_oversold_condition(
     return True
 
 # ======================
-#     SCREENER IN BULK
+#     DOWNLOAD BULK
 # ======================
 @st.cache_data
 def download_data_in_bulk(tickers, start, end):
@@ -148,6 +149,68 @@ def download_data_in_bulk(tickers, start, end):
     
     return data
 
+# ======================
+#   STAGIONALITÀ
+# ======================
+@st.cache_data
+def compute_seasonality_score(ticker, years=5):
+    """
+    Calcola un indicatore di quanto il titolo stia seguendo la propria stagionalità
+    basandosi su dati degli ultimi 'years' anni (default 5).
+    - Scarica dati (1d) per 'years' anni
+    - Calcola i rendimenti mensili medi storici
+    - Confronta il rendimento del mese corrente con quello storico
+    Restituisce la differenza in punti percentuali:
+      (rendimento mese corrente) - (rendimento medio storico di questo mese)
+    """
+    end = datetime.now()
+    start = end - timedelta(days=365 * years)
+    
+    try:
+        df = yf.download(ticker, start=start, end=end, interval="1d")
+    except Exception as e:
+        st.warning(f"Error downloading historical data for seasonality: {e}")
+        return None
+    
+    if df.empty:
+        return None
+    
+    df['Month'] = df.index.month
+    df['Year'] = df.index.year
+    
+    # Rendimento giornaliero in percentuale
+    df['Daily_Return'] = df['Close'].pct_change()
+    
+    # Raggruppiamo per anno + mese e sommiamo i daily return (approccio semplificato)
+    monthly = df.groupby(['Year','Month'])['Daily_Return'].sum().reset_index()
+    
+    # Media storica per ogni mese (1..12)
+    monthly_avg = monthly.groupby('Month')['Daily_Return'].mean()
+    
+    current_year = end.year
+    current_month = end.month
+    
+    row_current = monthly[(monthly['Year'] == current_year) & (monthly['Month'] == current_month)]
+    if row_current.empty:
+        # Se il mese è in corso e manca la fine, calcoliamo partial return
+        df_this_month = df[(df.index.year == current_year) & (df.index.month == current_month)]
+        if df_this_month.empty:
+            return None
+        actual_return = df_this_month['Daily_Return'].sum()
+    else:
+        actual_return = row_current['Daily_Return'].iloc[0]
+    
+    if current_month not in monthly_avg.index:
+        return None
+    avg_return = monthly_avg.loc[current_month]
+    
+    # Differenza in punti percentuali
+    diff = (actual_return - avg_return) * 100  # es. 2.5 => +2.5%
+    return diff
+
+# ======================
+#   SCREENER PRINCIPALE
+# ======================
 def fibonacci_retracement_screener(
     tickers, retracement=0.618,
     check_rsi=True, check_stoch=True, check_macd=True
@@ -159,6 +222,7 @@ def fibonacci_retracement_screener(
     - Verifica se current_price è vicino a tale livello
     - Calcola RSI, Stocastico, MACD
     - Verifica oversold su RSI, Stoch, MACD SOLO se selezionati
+    - Restituisce un DataFrame con i risultati
     """
     end = datetime.now()
     start = end - timedelta(days=30)
@@ -238,18 +302,22 @@ def fibonacci_retracement_screener(
 #         STREAMLIT
 # ======================
 def main():
-    st.title("Fibonacci Screener + Oversold Filters + Export to TradingView Watchlist")
-    st.write("**Ottimizzato per ridurre le richieste a yfinance**")
+    st.title("Fibonacci Screener + Oversold + Seasonality Check")
 
     # Parametri input
     min_market_cap = st.number_input("Minimum Market Cap (USD)", value=10_000_000_000, step=1_000_000_000)
     
-    fib_input = st.number_input(
-        "Fibonacci Retracement (0.0 - 1.0)", 
-        value=0.618, 
-        min_value=0.0, 
-        max_value=1.0, 
-        step=0.1
+    # Opzioni per il retracement (Fibonacci) più comuni
+    fib_options = [0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+    # Funzione per formattare la selectbox
+    def format_fib(x):
+        return f"{x*100:.1f}%"
+
+    fib_input = st.selectbox(
+        "Fibonacci Retracement",
+        options=fib_options,
+        index=fib_options.index(0.618),  # default su 61,8%
+        format_func=format_fib
     )
 
     # Flag per oversold
@@ -266,7 +334,8 @@ def main():
         
         # Pulizia ticker
         tickers = sp500_df['Symbol'].tolist()
-        tickers = [t.replace('.', '-') for t in tickers]  # yfinance usa i trattini
+        # yfinance richiede che i '.' siano sostituiti da '-'
+        tickers = [t.replace('.', '-') for t in tickers]
 
         st.write(f"2) Filtro per Market Cap >= {min_market_cap} ...")
         filtered_tickers = filter_stocks_by_market_cap(tickers, min_market_cap)
@@ -285,36 +354,49 @@ def main():
         )
 
         if results_df.empty:
-            st.info("Nessun titolo soddisfa i criteri (Fib vicino + oversold richiesti).")
+            st.info("Nessun titolo soddisfa i criteri (Fib vicino + oversold).")
         else:
-            st.success(f"Trovati {len(results_df)} titoli:")
+            st.success(f"Trovati {len(results_df)} titoli. Ora calcoliamo la Seasonality...")
+
+            # ==========================
+            #    CALCOLO STAGIONALITÀ
+            # ==========================
+            seasonality_scores = []
+            for t in results_df['Ticker']:
+                score = compute_seasonality_score(t, years=5)  # 5 anni di storico
+                if score is None:
+                    seasonality_scores.append(None)
+                else:
+                    # Aggiungiamo il valore (arrotondato)
+                    seasonality_scores.append(round(score, 2))
+
+            # Creiamo la colonna "Seasonality (%)" e spieghiamo il significato
+            results_df['Seasonality (%)'] = seasonality_scores
+
+            st.write("""
+            - **Seasonality (%)** > 0 significa che, per il mese corrente, 
+              il titolo sta rendendo più della media storica di quel mese.
+            - **Seasonality (%)** < 0 indica un rendimento inferiore alla media storica 
+              del mese (sottoperformance). 
+            - Un valore vicino a 0 indica che il titolo è in linea con la sua stagionalità storica.
+            """)
+
             st.dataframe(results_df)
 
-            # ==========================
-            #    EXPORT TICKERS
-            # ==========================
-            st.write("### Esporta Tickers per TradingView")
-
-            # 1) Creiamo la lista di ticker
+            # Esempio di export per TradingView
             watchlist_tickers = results_df['Ticker'].tolist()
-
-            # 2) Generiamo un CSV/txt in memoria
             csv_buffer = io.StringIO()
-            # TradingView in genere riconosce un ticker per riga, ad es. "AAPL"
             for t in watchlist_tickers:
                 csv_buffer.write(t + "\n")
-
             csv_data = csv_buffer.getvalue()
 
-            # 3) Permettiamo di scaricarlo
             st.download_button(
-                label="Scarica la Watchlist (txt)",
+                label="Scarica Ticker per TradingView",
                 data=csv_data,
                 file_name="my_tradingview_watchlist.txt",
                 mime="text/plain"
             )
-
-            st.info("Dopo il download, su TradingView > Watchlist > Import, seleziona il file .txt con i ticker.")
+            st.info("Import manuale in TradingView: Watchlist > Import .txt")
 
 if __name__ == "__main__":
     main()
