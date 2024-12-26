@@ -126,15 +126,24 @@ def fibonacci_screener_entry_stop(
     check_rsi=True, check_stoch=True, check_macd=True
 ):
     """
-    1) Scarica 6 mesi di dati
+    1) Scarica 3 mesi di dati a 1h
     2) Trova swing max/min precedenti (escludendo ultimi exclude_days)
     3) Se prezzo attuale è vicino al fib 61,8% e oversold:
        - Definisce entry e stop
     """
     end = datetime.now()
-    start = end - timedelta(days=6*30)
+    # Circa 90 giorni di storico orario (circa 3 mesi)
+    start = end - timedelta(days=90)
 
-    data = yf.download(tickers, start=start, end=end, group_by="ticker")
+    # <-- Aggiunto "interval='1h'" per avere dati orari
+    data = yf.download(
+        tickers, 
+        start=start, 
+        end=end, 
+        interval='1h',
+        group_by="ticker"
+    )
+
     single_ticker = (len(tickers) == 1)
     results = []
 
@@ -143,6 +152,7 @@ def fibonacci_screener_entry_stop(
             if single_ticker:
                 df_ticker = data
             else:
+                # Verifica che il ticker sia effettivamente presente nei dati scaricati
                 if ticker not in data.columns.levels[0]:
                     continue
                 df_ticker = data[ticker]
@@ -183,7 +193,7 @@ def fibonacci_screener_entry_stop(
 
             # Scegliamo di controllare solo 61.8% per esempio
             fib_618 = fib_levels['61.8%']
-            # Se prezzo attuale è vicino al 61,8% e "oversold" 
+            # Se prezzo attuale è vicino al 61,8% e "oversold"
             if is_near_level(current_price, fib_618, tolerance=0.01):
                 # Bullish/Bearish
                 if current_price >= fib_618:
@@ -219,12 +229,11 @@ def fibonacci_screener_entry_stop(
 
     return pd.DataFrame(results)
 
-
 ############################
 # App Streamlit di esempio
 ############################
 def main():
-    st.title("Fibonacci Screener + RSI/Stoch/MACD + Entry & Stop")
+    st.title("Fibonacci Screener + RSI/Stoch/MACD + Entry & Stop (1H Timeframe)")
 
     min_market_cap = st.number_input("Min Market Cap", value=10_000_000_000, step=1_000_000_000)
     exclude_days = st.number_input("Escludi ultimi N giorni (swing precedenti)", value=5, step=1)
@@ -250,8 +259,11 @@ def main():
             return
 
         df_results = fibonacci_screener_entry_stop(
-            filtered, exclude_days=exclude_days, 
-            check_rsi=rsi_flag, check_stoch=stoch_flag, check_macd=macd_flag
+            filtered, 
+            exclude_days=exclude_days, 
+            check_rsi=rsi_flag, 
+            check_stoch=stoch_flag, 
+            check_macd=macd_flag
         )
 
         if df_results.empty:
