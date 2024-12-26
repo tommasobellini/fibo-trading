@@ -2,102 +2,57 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
+import sys
+import os
 
-import pandas as pd
-import yfinance as yf
-from datetime import datetime, timedelta
-
-# ======================
-#  FUNZIONI DI SUPPORTO
-# ======================
-
+# =====================================
+#            FUNZIONI DI BASE
+# =====================================
+@st.cache_data
 def get_sp500_companies():
     """
-    Fetch the list of S&P 500 companies from Wikipedia.
+    Recupera la lista delle aziende S&P 500 da Wikipedia.
     """
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-    try:
-        tables = pd.read_html(url)
-        df = tables[0]  # La prima tabella contiene la lista delle aziende S&P 500
-        return df
-    except Exception as e:
-        print(f"Error fetching S&P 500 companies: {e}")
-        return pd.DataFrame()
+    tables = pd.read_html(url)
+    df = tables[0]
+    return df
 
-def get_market_caps(tickers):
+@st.cache_data
+def get_market_caps_bulk(tickers):
     """
-    Restituisce un dizionario {ticker: market_cap} per i ticker specificati,
-    recuperando l'informazione da yfinance.
+    Recupera in blocco i Market Cap dei ticker, usando yf.Tickers(...) invece
+    di invocare singolarmente Ticker(t).info per ognuno.
+    Restituisce un dizionario {ticker: market_cap}.
     """
+    joined_tickers = " ".join(tickers)
+    bulk_obj = yf.Tickers(joined_tickers)
+
     caps = {}
-    for ticker in tickers:
+    for t in tickers:
         try:
-            ticker_data = yf.Ticker(ticker)
-            market_cap = ticker_data.info.get('marketCap', 0)
-            caps[ticker] = market_cap
-        except Exception as e:
-            print(f"Error fetching market cap for {ticker}: {e}")
-            caps[ticker] = 0
+            info = bulk_obj.tickers[t].info
+            caps[t] = info.get('marketCap', 0)
+        except Exception:
+            caps[t] = 0
     return caps
 
 def filter_stocks_by_market_cap(tickers, min_market_cap=10_000_000_000):
     """
-    Filtra i ticker in base alla capitalizzazione di mercato minima.
+    Filtra i ticker in base alla capitalizzazione di mercato.
     """
-    # Recupera i market cap in batch
-    caps_dict = get_market_caps(tickers)
-
-    filtered_tickers = []
-    for ticker in tickers:
-        if caps_dict.get(ticker, 0) >= min_market_cap:
-            filtered_tickers.append(ticker)
-    return filtered_tickers
-
-def fibonacci_618_level(df):
-    """
-    Calcola il livello di Fibonacci 61,8% tra il massimo e il minimo dell'ultimo mese.
-    Restituisce il valore corrispondente.
-    """
-    if df.empty:
-        return None
-    max_price = df['High'].max()
-    min_price = df['Low'].min()
-    diff = max_price - min_price
-
-    # 61,8% level (ritracciamento)
-    level_618 = max_price - 0.618 * diff
-    return level_618
-
-def is_near_price(current_price, target_price, tolerance=0.01):
-    """
-    Verifica se current_price è entro la tolleranza (in percentuale) rispetto al valore target_price.
-    Esempio di default: 1% di tolleranza.
-    """
-    if target_price == 0:
-        return False
-    return abs(current_price - target_price) / abs(target_price) <= tolerance
+    caps_dict = get_market_caps_bulk(tickers)
+    filtered = [t for t in tickers if caps_dict.get(t, 0) >= min_market_cap]
+    return filtered
 
 # ======================
-#    INDICATORI TECNICI
+#   INDICATORI TECNICI
 # ======================
-
 def compute_rsi(series, period=14):
-    """
-    Calcolo RSI (Relative Strength Index) manuale,
-    per scopi dimostrativi. Restituisce una Serie contenente i valori di RSI.
-    
-    Formula semplificata:
-    1) Calcoliamo la differenza tra i prezzi consecutivi
-    2) Ripartiamo le differenze in 'guadagni' (positive) e 'perdite' (negative) 
-    3) Calcoliamo la media esponenziale dei guadagni (avg_gain) e delle perdite (avg_loss)
-    4) RSI = 100 - (100 / (1 + (avg_gain/avg_loss)))
-    """
     delta = series.diff()
-    # Guadagni (up) e perdite (down)
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
 
-    # Usiamo EMA per calcolare le medie esponenziali
     avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
     avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
 
@@ -106,27 +61,13 @@ def compute_rsi(series, period=14):
     return rsi
 
 def compute_stochastic(high, low, close, k_period=14, d_period=3):
-    """
-    Calcolo manuale dello Stocastico (valore %K e %D).
-    %K = 100 * (Close - LowestLow) / (HighestHigh - LowestLow)
-    %D = media mobile semplice di K su d_period
-    
-    Ritorna due Serie: stochK, stochD
-    """
     lowest_low = low.rolling(k_period).min()
     highest_high = high.rolling(k_period).max()
-    stochK = 100 * (close - lowest_low) / (highest_high - lowest_low)
-    stochD = stochK.rolling(d_period).mean()
-    return stochK, stochD
+    stoch_k = 100 * (close - lowest_low) / (highest_high - lowest_low)
+    stoch_d = stoch_k.rolling(d_period).mean()
+    return stoch_k, stoch_d
 
 def compute_macd(close, fastperiod=12, slowperiod=26, signalperiod=9):
-    """
-    Calcolo MACD base:
-    - MACD = EMA(fastperiod) - EMA(slowperiod)
-    - Signal = EMA(MACD, signalperiod)
-    - Histogram = MACD - Signal
-    """
-    # EMA veloci/lente
     ema_fast = close.ewm(span=fastperiod, adjust=False).mean()
     ema_slow = close.ewm(span=slowperiod, adjust=False).mean()
     macd = ema_fast - ema_slow
@@ -135,147 +76,250 @@ def compute_macd(close, fastperiod=12, slowperiod=26, signalperiod=9):
     return macd, signal, hist
 
 # ======================
-#       SCREENER
+#  FIBONACCI & OVERSOLD
 # ======================
-
-def fibonacci_retracement_screener(tickers):
+def fibonacci_level(df, retracement=0.618):
     """
-    Scarica i dati per l'ultimo mese di tutti i ticker,
-    calcola il livello di Fibonacci 61,8% e verifica se il prezzo
-    corrente è vicino a tale livello. Inoltre, calcola RSI, Stocastico e MACD
-    e verifica se indicano condizioni di oversold (in modo basilare).
+    Calcola il livello di Fibonacci personalizzato
+    (ad es. retracement=0.618 => 61,8%).
+    """
+    if df.empty:
+        return None
+    max_price = df['High'].max()
+    min_price = df['Low'].min()
+    diff = max_price - min_price
+    level = max_price - retracement * diff
+    return level
+
+def is_near_price(current_price, target_price, tolerance=0.01):
+    """
+    Verifica se il prezzo corrente è entro la tolleranza di (1% default)
+    rispetto al livello target.
+    """
+    if target_price == 0:
+        return False
+    return abs(current_price - target_price) / abs(target_price) <= tolerance
+
+def meets_oversold_condition(
+    rsi_latest, stoch_k_latest, macd_latest, signal_latest,
+    check_rsi, check_stoch, check_macd
+):
+    """
+    Applica i filtri di oversold solo se i flag (check_rsi, check_stoch, check_macd)
+    sono True.
+    - RSI oversold: rsi < 30
+    - Stocastico oversold: stoch_k < 20
+    - MACD oversold: macd < 0 e macd < signal
+    Restituisce True se TUTTE le condizioni scelte sono soddisfatte.
+    """
+    if check_rsi and (rsi_latest >= 30):
+        return False
+    if check_stoch and (stoch_k_latest >= 20):
+        return False
+    if check_macd and (macd_latest >= 0 or macd_latest >= signal_latest):
+        return False
     
-    Restituisce un DataFrame con i risultati.
-    """
-    results = []
+    return True
 
-    # Definiamo la finestra temporale per l'ultimo mese
+# ======================
+#     SCREENER IN BULK
+# ======================
+@st.cache_data
+def download_data_in_bulk(tickers, start, end):
+    """
+    Scarica i dati storici in blocco. Se i ticker sono >200, li dividiamo in chunk.
+    """
+    CHUNK_SIZE = 100
+    data_list = []
+    
+    for i in range(0, len(tickers), CHUNK_SIZE):
+        subset = tickers[i:i+CHUNK_SIZE]
+        try:
+            temp = yf.download(subset, start=start, end=end, group_by="ticker")
+            data_list.append(temp)
+        except Exception as e:
+            st.warning(f"Errore nello scaricare chunk: {e}")
+    
+    if not data_list:
+        return pd.DataFrame()
+    
+    data = data_list[0]
+    for extra_data in data_list[1:]:
+        data = pd.concat([data, extra_data], axis=1)
+    
+    return data
+
+def fibonacci_retracement_screener(
+    tickers, retracement=0.618,
+    check_rsi=True, check_stoch=True, check_macd=True
+):
+    """
+    Screener:
+    - Scarica i dati dell'ultimo mese
+    - Calcola il livello di Fibonacci personalizzato
+    - Verifica se current_price è vicino a tale livello
+    - Calcola RSI, Stocastico, MACD
+    - Verifica oversold su RSI, Stoch, MACD SOLO se selezionati
+    """
     end = datetime.now()
     start = end - timedelta(days=30)
 
-    # Scarichiamo in batch i dati storici di tutti i ticker filtrati
-    try:
-        data = yf.download(tickers, start=start, end=end, group_by="ticker")
-    except Exception as e:
-        print(f"Error downloading data for multiple tickers: {e}")
+    data = download_data_in_bulk(tickers, start, end)
+    if data.empty:
         return pd.DataFrame()
 
-    # Se abbiamo un singolo ticker, yfinance non crea un MultiIndex
-    single_ticker_mode = (len(tickers) == 1)
+    single_ticker = (len(tickers) == 1)
+    results = []
 
     for ticker in tickers:
+        # Prima di ogni elaborazione, verifichiamo se l'utente ha premuto "Stop"
+        # nel frattempo (vedi implementazione nella funzione main).
+        if "stop_screener" in st.session_state and st.session_state["stop_screener"]:
+            # Facciamo un return immediato con dataframe vuoto
+            return pd.DataFrame()
+
         try:
-            # Estraiamo i dati del singolo ticker
-            if single_ticker_mode:
+            if single_ticker:
                 df_ticker = data
             else:
-                # Quando i dati sono scaricati per più ticker,
-                # 'df_ticker' si trova in data[ticker].
                 if ticker not in data.columns.levels[0]:
-                    # Se il ticker non è presente, saltiamo
-                    print(f"No data found for {ticker}. Skipping.")
                     continue
                 df_ticker = data[ticker]
 
             if df_ticker.empty:
-                print(f"Data for {ticker} is empty. Skipping.")
                 continue
 
-            # ======================
-            #  FIBONACCI 61.8% CHECK
-            # ======================
-            current_price = df_ticker['Close'][-1]
-            level_618 = fibonacci_618_level(df_ticker)
-
-            if level_618 is None:
+            current_price = df_ticker['Close'].iloc[-1]
+            fib_lv = fibonacci_level(df_ticker, retracement)
+            if fib_lv is None:
                 continue
 
-            near_fib_618 = False
-            if is_near_price(current_price, level_618, tolerance=0.01):
-                near_fib_618 = True
+            near_fib = is_near_price(current_price, fib_lv, tolerance=0.01)
 
-            # ======================
-            #   INDICATORI TECNICI
-            # ======================
             close_series = df_ticker['Close']
-            high_series = df_ticker['High']
-            low_series  = df_ticker['Low']
+            high_series  = df_ticker['High']
+            low_series   = df_ticker['Low']
 
-            # Calcolo RSI
+            # RSI
             rsi_series = compute_rsi(close_series, period=14)
+            if rsi_series.dropna().empty:
+                continue
             rsi_latest = rsi_series.iloc[-1]
 
-            # Calcolo Stocastico
-            stochK, stochD = compute_stochastic(
-                high_series, low_series, close_series, k_period=14, d_period=3
-            )
-            stochK_latest = stochK.iloc[-1]
-            stochD_latest = stochD.iloc[-1]
+            # Stocastico
+            stoch_k, stoch_d = compute_stochastic(high_series, low_series, close_series)
+            if stoch_k.dropna().empty:
+                continue
+            stoch_k_latest = stoch_k.iloc[-1]
 
-            # Calcolo MACD
-            macd_line, signal_line, hist_line = compute_macd(close_series)
+            # MACD
+            macd_line, signal_line, _ = compute_macd(close_series)
+            if macd_line.dropna().empty:
+                continue
             macd_latest = macd_line.iloc[-1]
             signal_latest = signal_line.iloc[-1]
 
-            # ======================
-            #   CONDIZIONI OVERSOLD
-            # ======================
-            # Esempio di condizioni "basiche" di oversold:
-            # - RSI < 30
-            # - Stocastico < 20
-            # - MACD al di sotto della signal line e (macd_line < 0) => momentum negativo
-            rsi_oversold = (rsi_latest < 30)
-            stoch_oversold = (stochK_latest < 20)
-            macd_oversold = (macd_latest < signal_latest and macd_latest < 0)
+            # Oversold condition
+            oversold = meets_oversold_condition(
+                rsi_latest, stoch_k_latest, macd_latest, signal_latest,
+                check_rsi, check_stoch, check_macd
+            )
 
-            # Se siamo vicini al fib 61.8% e tutti e tre gli indicatori sono in oversold
-            # (puoi personalizzare la condizione in base alle tue esigenze)
-            if near_fib_618 and rsi_oversold and stoch_oversold and macd_oversold:
+            if near_fib and oversold:
                 results.append({
                     'Ticker': ticker,
                     'Current Price': round(current_price, 2),
-                    'Fibonacci 61,8%': round(level_618, 2),
+                    f'Fib {int(retracement*100)}%': round(fib_lv, 2),
                     'RSI': round(rsi_latest, 2),
-                    'Stoch K': round(stochK_latest, 2),
-                    'Stoch D': round(stochD_latest, 2),
-                    'MACD': round(macd_latest, 3),
-                    'Signal': round(signal_latest, 3),
+                    'StochK': round(stoch_k_latest, 2),
+                    'MACD': round(macd_latest, 2),
+                    'Signal': round(signal_latest, 2),
                 })
 
         except Exception as e:
-            print(f"Error processing {ticker}: {e}")
-            continue
-
+            st.warning(f"Errore su {ticker}: {e}")
+    
     return pd.DataFrame(results)
 
-# main semplificato
-def run_screener():
-    st.title("Fibonacci 61.8% Screener + RSI, Stoch, MACD (Oversold)")
+# ======================
+#         STREAMLIT
+# ======================
+def main():
+    st.title("Fibonacci Screener (livello personalizzato) + Oversold Filters + STOP")
+    st.write("**Ottimizzato per ridurre le richieste a yfinance.**")
 
-    # input eventuali (puoi aggiungere parametri personalizzabili)
-    min_market_cap = st.number_input("Minimum Market Cap (USD)", value=10000000000, step=1000000000)
+    # Inizializziamo la variabile di sessione per lo stop, se non esiste
+    if "stop_screener" not in st.session_state:
+        st.session_state["stop_screener"] = False
+
+    # Se l'utente preme "Stop Screener"
+    if st.button("Stop Screener"):
+        st.warning("Screener was forcibly stopped. Exiting...")
+        # 1) Impostiamo un flag di sessione
+        st.session_state["stop_screener"] = True
+        # 2) Se vogliamo proprio fermare il process Python, usiamo sys.exit()
+        #    o os._exit(0). Questo causerà un errore "Application disconnected"
+        #    in Streamlit, terminando l'app.
+        # sys.exit("User requested exit")
+        os._exit(0)  # forza la chiusura immediata del processo
+
+    # Parametri input
+    min_market_cap = st.number_input("Minimum Market Cap (USD)", value=10_000_000_000, step=1_000_000_000)
     
-    if st.button("Run Screener"):
-        st.write("Recupero la lista S&P 500 e calcolo i dati...")
+    fib_input = st.number_input(
+        "Fibonacci Retracement (0.0 - 1.0)", 
+        value=0.618, 
+        min_value=0.0, 
+        max_value=1.0, 
+        step=0.1
+    )
+
+    # Flag per oversold
+    rsi_flag = st.checkbox("RSI < 30", value=True)
+    stoch_flag = st.checkbox("Stocastico K < 20", value=True)
+    macd_flag = st.checkbox("MACD < 0 e MACD < Signal", value=True)
+
+    if st.button("Esegui Screener"):
+        # Prima di iniziare, azzeriamo l'eventuale stop
+        st.session_state["stop_screener"] = False
+
+        st.write("1) Recupero lista S&P 500...")
         sp500_df = get_sp500_companies()
         if sp500_df.empty:
-            st.warning("Failed to retrieve the list of S&P 500 companies.")
+            st.error("Impossibile scaricare la lista S&P 500.")
             return
         
+        # Pulizia ticker
         tickers = sp500_df['Symbol'].tolist()
-        tickers = [ticker.replace('.', '-') for ticker in tickers]
-        
-        st.write("Filtraggio per market cap...")
+        tickers = [t.replace('.', '-') for t in tickers]
+
+        st.write(f"2) Filtro per Market Cap >= {min_market_cap} ...")
         filtered_tickers = filter_stocks_by_market_cap(tickers, min_market_cap)
-        
-        st.write("Download dati e calcolo Fibonacci, RSI, Stocastico, MACD...")
-        results_df = fibonacci_retracement_screener(filtered_tickers)
-        
+        st.write("Ticker trovati dopo il filtro:", len(filtered_tickers))
+        if not filtered_tickers:
+            st.warning("Nessun ticker supera la capitalizzazione richiesta.")
+            return
+
+        st.write("3) Calcolo Fibonacci + Indicatori (RSI, Stoch, MACD)...")
+        results_df = fibonacci_retracement_screener(
+            filtered_tickers,
+            retracement=fib_input,
+            check_rsi=rsi_flag,
+            check_stoch=stoch_flag,
+            check_macd=macd_flag
+        )
+
+        # Se l'utente ha premuto Stop durante l'esecuzione, results_df sarà vuoto
+        if st.session_state["stop_screener"]:
+            st.warning("Lo screener è stato interrotto prima del completamento.")
+            return
+
         if results_df.empty:
-            st.info("Nessun titolo soddisfa i criteri (Fib 61.8% + oversold).")
+            st.info("Nessun titolo soddisfa i criteri (Fib vicino + oversold richiesti).")
         else:
-            st.success("Titoli trovati:")
+            st.success(f"Trovati {len(results_df)} titoli:")
             st.dataframe(results_df)
 
+
 if __name__ == "__main__":
-    run_screener()
+    main()
