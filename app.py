@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 import io
@@ -68,8 +69,8 @@ def is_near_level(current_price, target_price, tolerance=0.01):
 ############################
 def compute_rsi(series, period=14):
     delta = series.diff()
-    gain = delta.where(delta>0, 0.0)
-    loss = -delta.where(delta<0, 0.0)
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
     avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
     avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
     rs = avg_gain / avg_loss
@@ -91,17 +92,77 @@ def compute_macd(close, fastperiod=12, slowperiod=26, signalperiod=9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
+############################
+# Dynamic Price Oscillator
+############################
+def compute_dynamic_price_oscillator(df, length=33, smooth_factor=5):
+    """
+    Calcola il Dynamic Price Oscillator (Zeiierman) e le relative Bollinger Bands.
+    Restituisce una Series per l'oscillatore e 4 Series per le Bollinger Bands:
+      - bbHigh, bbLow (dev=1)
+      - bbHighExp, bbLowExp (dev=2)
+    """
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+
+    # True Range
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    vol_adj_price = true_range.ewm(span=length, adjust=False).mean()
+
+    # priceChange = close - close[length]
+    price_change = close - close.shift(length)
+    # priceDelta  = close - volAdjPrice
+    price_delta = close - vol_adj_price
+
+    # oscillator  = ta.ema(avg(priceDelta, priceChange), smoothFactor)
+    avg_series = (price_delta + price_change) / 2
+    oscillator = avg_series.ewm(span=smooth_factor, adjust=False).mean()
+
+    # Bollinger su oscillator (nel Pine: length * 5)
+    bb_length = length * 5
+
+    # basis e std
+    basis_1dev = oscillator.rolling(bb_length).mean()
+    std_1dev   = oscillator.rolling(bb_length).std()
+
+    bbHigh = basis_1dev + 1 * std_1dev
+    bbLow  = basis_1dev - 1 * std_1dev
+
+    # Per dev=2
+    bbHighExp = basis_1dev + 2 * std_1dev
+    bbLowExp  = basis_1dev - 2 * std_1dev
+
+    return oscillator, bbHigh, bbLow, bbHighExp, bbLowExp
+
+############################
+# Logica oversold con DPO
+############################
 def is_oversold(rsi_val, stoch_k_val, macd_val, signal_val,
-                check_rsi=True, check_stoch=True, check_macd=True):
+                check_rsi=True, check_stoch=True, check_macd=True,
+                check_dpo=False, dpo_val=None, dpo_bb_low_exp=None):
     # RSI oversold: rsi < 30
-    # Stoch oversold: stoch_k < 20
-    # MACD oversold: macd < 0 e macd < signal
     if check_rsi and rsi_val >= 30:
         return False
+
+    # Stoch oversold: stoch_k < 20
     if check_stoch and stoch_k_val >= 20:
         return False
+
+    # MACD oversold: macd < 0 e macd < signal
     if check_macd and (macd_val >= 0 or macd_val >= signal_val):
         return False
+
+    # DPO oversold: oscillator < bbLowExp
+    if check_dpo:
+        if dpo_val is None or dpo_bb_low_exp is None:
+            return False
+        if dpo_val >= dpo_bb_low_exp:
+            return False
+
     return True
 
 ############################
@@ -111,8 +172,7 @@ def define_trade_levels(current_price, min_price):
     """
     Esempio: 
       - Entry Price = current_price (ipotizziamo ingresso immediato)
-      - Stop Price = 1% sotto il min_price (lo swing low precedente),
-        così se il mercato rompe quel minimo, esce in stop.
+      - Stop Price = 1% sotto il min_price (lo swing low precedente)
     """
     entry_price = current_price
     stop_price = min_price * 0.99  # 1% sotto
@@ -122,20 +182,24 @@ def define_trade_levels(current_price, min_price):
 # Screener principale
 ############################
 def fibonacci_screener_entry_stop(
-    tickers, exclude_days=5, 
-    check_rsi=True, check_stoch=True, check_macd=True
+    tickers, 
+    exclude_days=5, 
+    check_rsi=True, 
+    check_stoch=True, 
+    check_macd=True,
+    check_dpo=False,  # <-- nuovo flag
+    dpo_length=33,
+    dpo_smooth=5
 ):
     """
-    1) Scarica 3 mesi di dati a 1h
+    1) Scarica ~3 mesi di dati orari
     2) Trova swing max/min precedenti (escludendo ultimi exclude_days)
-    3) Se prezzo attuale è vicino al fib 61,8% e oversold:
+    3) Se prezzo attuale è vicino al fib 61,8% e oversold (rsi, stoch, macd, DPO):
        - Definisce entry e stop
     """
     end = datetime.now()
-    # Circa 90 giorni di storico orario (circa 3 mesi)
     start = end - timedelta(days=90)
 
-    # <-- Aggiunto "interval='1h'" per avere dati orari
     data = yf.download(
         tickers, 
         start=start, 
@@ -152,7 +216,6 @@ def fibonacci_screener_entry_stop(
             if single_ticker:
                 df_ticker = data
             else:
-                # Verifica che il ticker sia effettivamente presente nei dati scaricati
                 if ticker not in data.columns.levels[0]:
                     continue
                 df_ticker = data[ticker]
@@ -170,10 +233,10 @@ def fibonacci_screener_entry_stop(
 
             current_price = df_ticker['Close'].iloc[-1]
 
-            # Calcolo indicatori
+            # Calcolo indicatori base
             close_series = df_ticker['Close']
             high_series = df_ticker['High']
-            low_series = df_ticker['Low']
+            low_series  = df_ticker['Low']
 
             rsi_series = compute_rsi(close_series, period=14)
             if rsi_series.dropna().empty:
@@ -191,20 +254,38 @@ def fibonacci_screener_entry_stop(
             macd_val = macd_line.iloc[-1]
             signal_val = signal_line.iloc[-1]
 
-            # Scegliamo di controllare solo 61.8% per esempio
+            # Calcolo DPO se check_dpo=True
+            dpo_val = None
+            dpo_bb_low_exp = None
+            if check_dpo:
+                oscillator, bbHigh, bbLow, bbHighExp, bbLowExp = compute_dynamic_price_oscillator(
+                    df_ticker, length=dpo_length, smooth_factor=dpo_smooth
+                )
+                if oscillator.dropna().empty or bbLowExp.dropna().empty:
+                    continue
+                dpo_val = oscillator.iloc[-1]
+                dpo_bb_low_exp = bbLowExp.iloc[-1]
+
+            # Verifichiamo se il prezzo è vicino al 61.8% di Fibonacci
             fib_618 = fib_levels['61.8%']
-            # Se prezzo attuale è vicino al 61,8% e "oversold"
             if is_near_level(current_price, fib_618, tolerance=0.01):
+                
                 # Bullish/Bearish
                 if current_price >= fib_618:
                     fib_trend = "Bullish"
                 else:
                     fib_trend = "Bearish"
 
-                # Check oversold
-                if is_oversold(rsi_val, stoch_k_val, macd_val, signal_val,
-                               check_rsi, check_stoch, check_macd):
-                    # Definiamo Entry e Stop
+                # Check oversold con la nostra funzione aggiornata
+                if is_oversold(
+                    rsi_val, stoch_k_val, macd_val, signal_val,
+                    check_rsi=check_rsi,
+                    check_stoch=check_stoch,
+                    check_macd=check_macd,
+                    check_dpo=check_dpo,
+                    dpo_val=dpo_val,
+                    dpo_bb_low_exp=dpo_bb_low_exp
+                ):
                     entry_price, stop_price = define_trade_levels(current_price, min_price)
 
                     results.append({
@@ -218,7 +299,9 @@ def fibonacci_screener_entry_stop(
                         'StochK': round(stoch_k_val, 2),
                         'MACD': round(macd_val, 2),
                         'Signal': round(signal_val, 2),
-                        # Nuove colonne
+                        # DPO info
+                        'DPO': round(dpo_val, 2) if dpo_val is not None else None,
+                        'DPO BB LowExp': round(dpo_bb_low_exp, 2) if dpo_bb_low_exp is not None else None,
                         'Entry Price': entry_price,
                         'Stop Price': stop_price
                     })
@@ -230,18 +313,23 @@ def fibonacci_screener_entry_stop(
     return pd.DataFrame(results)
 
 ############################
-# App Streamlit di esempio
+# App Streamlit
 ############################
 def main():
-    st.title("Fibonacci Screener + RSI/Stoch/MACD + Entry & Stop (1H Timeframe)")
+    st.title("Fibonacci Screener + RSI/Stoch/MACD + DPO (Zeiierman)")
 
     min_market_cap = st.number_input("Min Market Cap", value=10_000_000_000, step=1_000_000_000)
     exclude_days = st.number_input("Escludi ultimi N giorni (swing precedenti)", value=5, step=1)
     
-    # Flag oversold
+    # Flag oversold classici
     rsi_flag = st.checkbox("RSI < 30", value=True)
     stoch_flag = st.checkbox("Stocastico < 20", value=True)
     macd_flag = st.checkbox("MACD < 0 e MACD < Signal", value=True)
+
+    # Flag e parametri DPO
+    dpo_flag = st.checkbox("Usa Dynamic Price Oscillator (oversold = DPO < Bollinger LowExp)", value=False)
+    dpo_length_val = st.number_input("DPO Length (default=33)", value=33, step=1)
+    dpo_smooth_val = st.number_input("DPO Smoothing Factor (default=5)", value=5, step=1)
 
     if st.button("Esegui Screener"):
         sp500_df = get_sp500_companies()
@@ -259,20 +347,23 @@ def main():
             return
 
         df_results = fibonacci_screener_entry_stop(
-            filtered, 
+            tickers=filtered, 
             exclude_days=exclude_days, 
             check_rsi=rsi_flag, 
             check_stoch=stoch_flag, 
-            check_macd=macd_flag
+            check_macd=macd_flag,
+            check_dpo=dpo_flag,
+            dpo_length=dpo_length_val,
+            dpo_smooth=dpo_smooth_val
         )
 
         if df_results.empty:
-            st.info("Nessun titolo rispetta i criteri (vicino a Fib 61.8%, oversold).")
+            st.info("Nessun titolo rispetta i criteri (vicino al Fib 61.8% + oversold).")
         else:
             st.success(f"Trovati {len(df_results)} titoli. Mostriamo entry e stop proposti:")
             st.dataframe(df_results)
 
-            # Export
+            # Export watchlist
             watchlist = df_results['Ticker'].tolist()
             csv_buffer = io.StringIO()
             for t in watchlist:
