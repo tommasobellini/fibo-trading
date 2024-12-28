@@ -413,4 +413,90 @@ def main():
     
     # Parametri principali
     st.subheader("1) Parametri di filtraggio")
-    min_market_cap = st.number_
+    min_market_cap = st.number_input("Min Market Cap (in $)", value=10_000_000_000, step=1_000_000_000)
+    exclude_days = st.number_input("Escludi ultimi N giorni (swing precedenti)", value=5, step=1)
+
+    st.subheader("2) Parametri di 'Oversold'")
+    rsi_flag = st.checkbox("RSI < soglia (default 30)?", value=True)
+    rsi_thr = st.number_input("Soglia RSI", value=30, step=1)
+
+    stoch_flag = st.checkbox("Stocastico < soglia (default 20)?", value=True)
+    stoch_thr = st.number_input("Soglia Stocastico", value=20, step=1)
+
+    macd_flag = st.checkbox("MACD < 0 e MACD < Signal?", value=True)
+
+    st.subheader("3) Parametri DPO")
+    dpo_mode = st.selectbox(
+        "DPO Condition",
+        ["Nessuna", "Oversold (DPO < BB Low)", "Overbought (DPO > BB High)"],
+        index=0
+    )
+    dpo_length_val = st.number_input("DPO Length (default=33)", value=33, step=1)
+    dpo_smooth_val = st.number_input("DPO Smoothing Factor (default=5)", value=5, step=1)
+
+    st.subheader("4) Parametri Fibonacci e Stop")
+    fib_tolerance = st.number_input("Tolleranza Fib 61.8% (es: 0.01 = 1%)", value=0.01, step=0.001)
+    stop_pct_val = st.number_input("Stop Loss % sotto il minimo swing", value=0.01, step=0.001)
+
+    if st.button("Esegui Screener"):
+        sp500_df = get_sp500_companies()
+        if sp500_df.empty:
+            st.error("Impossibile scaricare la lista S&P 500 o tabella vuota.")
+            return
+        
+        tickers = sp500_df['Symbol'].tolist()
+        # In Yahoo Finance, i ticker con punto vanno sostituiti col trattino
+        tickers = [t.replace('.', '-') for t in tickers]
+
+        # Filtro per capitalizzazione
+        filtered = filter_stocks_by_market_cap(tickers, min_market_cap)
+        st.write("Numero di ticker dopo il filtro Market Cap:", len(filtered))
+        if not filtered:
+            st.warning("Nessun ticker supera la capitalizzazione richiesta.")
+            return
+
+        # Eseguiamo lo screener
+        df_results = fibonacci_screener_entry_stop(
+            tickers=filtered,
+            exclude_days=exclude_days,
+            check_rsi=rsi_flag,
+            check_stoch=stoch_flag,
+            check_macd=macd_flag,
+            dpo_mode=dpo_mode,
+            dpo_length=dpo_length_val,
+            dpo_smooth=dpo_smooth_val,
+            fib_tolerance=fib_tolerance,
+            rsi_threshold=rsi_thr,
+            stoch_threshold=stoch_thr,
+            stop_pct=stop_pct_val
+        )
+
+        if df_results.empty:
+            st.info("Nessun titolo rispetta i criteri selezionati.")
+        else:
+            st.success(f"Trovati {len(df_results)} titoli. Mostriamo entry e stop proposti:")
+            st.dataframe(df_results)
+
+            # Export watchlist in formato testo
+            watchlist = df_results['Ticker'].tolist()
+            csv_buffer = io.StringIO()
+            for t in watchlist:
+                csv_buffer.write(t + "\n")
+            csv_data = csv_buffer.getvalue()
+
+            st.download_button(
+                label="Scarica Tickers",
+                data=csv_data,
+                file_name="my_watchlist_fib.txt",
+                mime="text/plain"
+            )
+
+    # Piccola nota/disclaimer a fondo pagina
+    st.write("---")
+    st.markdown("""
+    **Disclaimer**: Questo screener è a puro scopo didattico. 
+    Non costituisce consiglio finanziario. Si raccomanda di fare le proprie analisi prima di effettuare operazioni di trading.
+    """)
+
+if __name__ == "__main__":
+    main()
