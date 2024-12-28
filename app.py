@@ -157,10 +157,10 @@ def compute_dynamic_price_oscillator(df, length=33, smooth_factor=5):
     true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     vol_adj_price = true_range.ewm(span=length, adjust=False).mean()
 
-    # price_change = close - close.shift(length)
+    # price_change
     price_change = close - close.shift(length)
 
-    # price_delta = close - vol_adj_price
+    # price_delta
     price_delta = close - vol_adj_price
 
     # oscillator = EMA( avg(priceDelta, priceChange), smooth_factor )
@@ -207,7 +207,7 @@ def passes_osc_conditions(
     return True
 
 def passes_dpo_condition(
-    dpo_val, bb_low, bb_high,
+    dpo_val, dpo_bb_low, dpo_bb_high,
     dpo_mode="Nessuna"
 ):
     """
@@ -219,17 +219,17 @@ def passes_dpo_condition(
     # Evitiamo errori
     if (
         dpo_val is None or pd.isna(dpo_val)
-        or bb_low is None or pd.isna(bb_low)
-        or bb_high is None or pd.isna(bb_high)
+        or dpo_bb_low is None or pd.isna(dpo_bb_low)
+        or dpo_bb_high is None or pd.isna(dpo_bb_high)
     ):
         return False
 
     # Logica di oversold
-    if dpo_mode.startswith("Oversold") and dpo_val >= bb_low:
+    if dpo_mode.startswith("Oversold") and dpo_val >= dpo_bb_low:
         return False
 
     # Logica di overbought
-    if dpo_mode.startswith("Overbought") and dpo_val <= bb_high:
+    if dpo_mode.startswith("Overbought") and dpo_val <= dpo_bb_high:
         return False
 
     return True
@@ -249,7 +249,7 @@ def define_trade_levels(current_price, min_price, stop_pct=0.01):
     return round(entry_price, 2), round(stop_price, 2)
 
 ############################
-# Screener principale
+# Screener Fibonacci
 ############################
 def fibonacci_screener_entry_stop(
     tickers, 
@@ -266,40 +266,34 @@ def fibonacci_screener_entry_stop(
     stop_pct=0.01            # Parametro per personalizzare la distanza dello stop dal minimo
 ):
     """
-    1) Scarica ~3 mesi di dati orari
-    2) Trova swing max/min precedenti (escludendo ultimi exclude_days)
-    3) Se prezzo attuale è vicino al Fib 61.8% e oversold/overbought => definisce entry e stop
+    Screener originale basato su Fibonacci 61.8% + RSI/Stoch/MACD + DPO.
     """
     end = datetime.now()
     start = end - timedelta(days=90)
 
-    # Scarichiamo i dati in blocco per tutti i ticker
-    # (Yahoo Finance permette più ticker in una singola query)
+    # Scarichiamo i dati in blocco per tutti i ticker (1h)
     data = yf.download(
         tickers,
         start=start,
         end=end,
         interval='1h',
         group_by="ticker",
-        progress=False  # Disabilitiamo la barra di progresso di yfinance per alleggerire l'output
+        progress=False
     )
 
     single_ticker = (len(tickers) == 1)
     results = []
 
-    # Per monitorare l'avanzamento
     my_bar = st.progress(0)
     total = len(tickers)
 
     for i, ticker in enumerate(tickers):
         try:
-            # Aggiorna la barra di progresso
             my_bar.progress((i + 1) / total)
 
             if single_ticker:
                 df_ticker = data
             else:
-                # Se i dati non sono disponibili per un ticker, saltiamo
                 if ticker not in data.columns.levels[0]:
                     continue
                 df_ticker = data[ticker]
@@ -316,7 +310,7 @@ def fibonacci_screener_entry_stop(
 
             current_price = df_ticker['Close'].iloc[-1]
 
-            # Calcolo indicatori
+            # Indicatori
             close_series = df_ticker['Close']
             high_series  = df_ticker['High']
             low_series   = df_ticker['Low']
@@ -352,7 +346,7 @@ def fibonacci_screener_entry_stop(
                 dpo_bb_low  = bbLow.iloc[-1]
                 dpo_bb_high = bbHigh.iloc[-1]
 
-            # Controllo Fib 61.8%
+            # Fib 61.8%
             fib_618 = fib_levels['61.8%']
 
             # Verifichiamo se il current_price è vicino al 61.8% di Fibonacci
@@ -398,45 +392,134 @@ def fibonacci_screener_entry_stop(
                 })
 
         except Exception as e:
-            # In caso di errore su un singolo ticker, lo segnaliamo ma continuiamo
             st.warning(f"Errore su {ticker}: {e}")
             continue
 
-    my_bar.empty()  # Rimuoviamo la barra di avanzamento
+    my_bar.empty()
     return pd.DataFrame(results)
 
 ############################
-# App Streamlit
+# NUOVA FUNZIONE: Screener Breakout Mensile
+############################
+def monthly_breakout_screener(
+    tickers,
+    n_months=3,         # Calcolo breakout sugli ultimi N mesi
+    start_date="2020-01-01",
+    end_date=None
+):
+    """
+    Scarica i dati giornalieri per ogni ticker, ricampiona mensilmente,
+    verifica se la chiusura mensile supera il max (breakout long) o scende sotto il min (breakout short)
+    degli ultimi n_months.
+    """
+    if end_date is None:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+    
+    results = []
+    my_bar = st.progress(0)
+    total = len(tickers)
+
+    # Scarichiamo i dati per ogni ticker separatamente per gestire eventuali errori
+    for i, ticker in enumerate(tickers):
+        my_bar.progress((i + 1) / total)
+        try:
+            df_daily = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            if df_daily.empty:
+                continue
+
+            # Ricampioniamo su base mensile
+            df_monthly = df_daily.resample('M').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last'
+            })
+            df_monthly.dropna(inplace=True)
+
+            # Rolling max e min degli ultimi n_months (con shift(1) per evitare lookahead)
+            df_monthly['rolling_max'] = df_monthly['High'].rolling(n_months).max().shift(1)
+            df_monthly['rolling_min'] = df_monthly['Low'].rolling(n_months).min().shift(1)
+
+            # Segnale breakout
+            df_monthly['signal'] = 0
+            df_monthly.loc[df_monthly['Close'] > df_monthly['rolling_max'], 'signal'] = 1
+            df_monthly.loc[df_monthly['Close'] < df_monthly['rolling_min'], 'signal'] = -1
+
+            # Ritorniamo solo l'ultimo segnale (l'ultima riga)
+            latest = df_monthly.iloc[-1]
+            signal_value = latest['signal']
+
+            if pd.isna(signal_value):
+                continue
+
+            if signal_value == 1:
+                direction = "Breakout Long"
+            elif signal_value == -1:
+                direction = "Breakout Short"
+            else:
+                direction = "No breakout"
+
+            # Aggiungiamo i risultati in tabella
+            results.append({
+                "Ticker": ticker,
+                "Ultima Chiusura (mensile)": round(latest['Close'], 2),
+                f"Max Ultimi {n_months} mesi": round(latest['rolling_max'], 2) if not pd.isna(latest['rolling_max']) else None,
+                f"Min Ultimi {n_months} mesi": round(latest['rolling_min'], 2) if not pd.isna(latest['rolling_min']) else None,
+                "Segnale": direction
+            })
+        except Exception as e:
+            st.warning(f"Errore su {ticker}: {e}")
+            continue
+
+    my_bar.empty()
+    return pd.DataFrame(results)
+
+############################
+# App Streamlit (MODIFICATA)
 ############################
 def main():
-    st.title("Fibonacci Screener + RSI/Stoch/MACD + DPO (oversold/overbought)")
+    st.title("Screener Multiplo: Fibonacci / Breakout Mensile")
     
-    # Parametri principali
+    # Scelta della strategia
+    st.subheader("Seleziona la strategia da eseguire:")
+    strategy_choice = st.selectbox(
+        "Strategia",
+        ["Fibonacci RSI/Stoch/MACD + DPO", "Breakout Mensile (N mesi)"]
+    )
+
     st.subheader("1) Parametri di filtraggio")
     min_market_cap = st.number_input("Min Market Cap (in $)", value=10_000_000_000, step=1_000_000_000)
-    exclude_days = st.number_input("Escludi ultimi N giorni (swing precedenti)", value=5, step=1)
+    
+    if strategy_choice == "Fibonacci RSI/Stoch/MACD + DPO":
+        exclude_days = st.number_input("Escludi ultimi N giorni (swing precedenti)", value=5, step=1)
+        
+        st.subheader("2) Parametri di 'Oversold'")
+        rsi_flag = st.checkbox("RSI < soglia (default 30)?", value=True)
+        rsi_thr = st.number_input("Soglia RSI", value=30, step=1)
 
-    st.subheader("2) Parametri di 'Oversold'")
-    rsi_flag = st.checkbox("RSI < soglia (default 30)?", value=True)
-    rsi_thr = st.number_input("Soglia RSI", value=30, step=1)
+        stoch_flag = st.checkbox("Stocastico < soglia (default 20)?", value=True)
+        stoch_thr = st.number_input("Soglia Stocastico", value=20, step=1)
 
-    stoch_flag = st.checkbox("Stocastico < soglia (default 20)?", value=True)
-    stoch_thr = st.number_input("Soglia Stocastico", value=20, step=1)
+        macd_flag = st.checkbox("MACD < 0 e MACD < Signal?", value=True)
 
-    macd_flag = st.checkbox("MACD < 0 e MACD < Signal?", value=True)
+        st.subheader("3) Parametri DPO")
+        dpo_mode = st.selectbox(
+            "DPO Condition",
+            ["Nessuna", "Oversold (DPO < BB Low)", "Overbought (DPO > BB High)"],
+            index=0
+        )
+        dpo_length_val = st.number_input("DPO Length (default=33)", value=33, step=1)
+        dpo_smooth_val = st.number_input("DPO Smoothing Factor (default=5)", value=5, step=1)
 
-    st.subheader("3) Parametri DPO")
-    dpo_mode = st.selectbox(
-        "DPO Condition",
-        ["Nessuna", "Oversold (DPO < BB Low)", "Overbought (DPO > BB High)"],
-        index=0
-    )
-    dpo_length_val = st.number_input("DPO Length (default=33)", value=33, step=1)
-    dpo_smooth_val = st.number_input("DPO Smoothing Factor (default=5)", value=5, step=1)
+        st.subheader("4) Parametri Fibonacci e Stop")
+        fib_tolerance = st.number_input("Tolleranza Fib 61.8% (es: 0.01 = 1%)", value=0.01, step=0.001)
+        stop_pct_val = st.number_input("Stop Loss % sotto il minimo swing", value=0.01, step=0.001)
 
-    st.subheader("4) Parametri Fibonacci e Stop")
-    fib_tolerance = st.number_input("Tolleranza Fib 61.8% (es: 0.01 = 1%)", value=0.01, step=0.001)
-    stop_pct_val = st.number_input("Stop Loss % sotto il minimo swing", value=0.01, step=0.001)
+    else:
+        # Parametri specifici della strategia di Breakout Mensile
+        st.subheader("2) Parametri Breakout Mensile")
+        n_months = st.number_input("N mesi di lookback per il breakout (es: 3)", value=3, step=1)
+        start_str = st.text_input("Data inizio (YYYY-MM-DD)", "2020-01-01")
 
     if st.button("Esegui Screener"):
         sp500_df = get_sp500_companies()
@@ -455,41 +538,70 @@ def main():
             st.warning("Nessun ticker supera la capitalizzazione richiesta.")
             return
 
-        # Eseguiamo lo screener
-        df_results = fibonacci_screener_entry_stop(
-            tickers=filtered,
-            exclude_days=exclude_days,
-            check_rsi=rsi_flag,
-            check_stoch=stoch_flag,
-            check_macd=macd_flag,
-            dpo_mode=dpo_mode,
-            dpo_length=dpo_length_val,
-            dpo_smooth=dpo_smooth_val,
-            fib_tolerance=fib_tolerance,
-            rsi_threshold=rsi_thr,
-            stoch_threshold=stoch_thr,
-            stop_pct=stop_pct_val
-        )
-
-        if df_results.empty:
-            st.info("Nessun titolo rispetta i criteri selezionati.")
-        else:
-            st.success(f"Trovati {len(df_results)} titoli. Mostriamo entry e stop proposti:")
-            st.dataframe(df_results)
-
-            # Export watchlist in formato testo
-            watchlist = df_results['Ticker'].tolist()
-            csv_buffer = io.StringIO()
-            for t in watchlist:
-                csv_buffer.write(t + "\n")
-            csv_data = csv_buffer.getvalue()
-
-            st.download_button(
-                label="Scarica Tickers",
-                data=csv_data,
-                file_name="my_watchlist_fib.txt",
-                mime="text/plain"
+        if strategy_choice == "Fibonacci RSI/Stoch/MACD + DPO":
+            # Esegui lo screener Fibonacci
+            df_results = fibonacci_screener_entry_stop(
+                tickers=filtered,
+                exclude_days=exclude_days,
+                check_rsi=rsi_flag,
+                check_stoch=stoch_flag,
+                check_macd=macd_flag,
+                dpo_mode=dpo_mode,
+                dpo_length=dpo_length_val,
+                dpo_smooth=dpo_smooth_val,
+                fib_tolerance=fib_tolerance,
+                rsi_threshold=rsi_thr,
+                stoch_threshold=stoch_thr,
+                stop_pct=stop_pct_val
             )
+
+            if df_results.empty:
+                st.info("Nessun titolo rispetta i criteri selezionati.")
+            else:
+                st.success(f"Trovati {len(df_results)} titoli con strategia Fibonacci:")
+                st.dataframe(df_results)
+
+                # Export watchlist in formato testo
+                watchlist = df_results['Ticker'].tolist()
+                csv_buffer = io.StringIO()
+                for t in watchlist:
+                    csv_buffer.write(t + "\n")
+                csv_data = csv_buffer.getvalue()
+
+                st.download_button(
+                    label="Scarica Tickers",
+                    data=csv_data,
+                    file_name="my_watchlist_fib.txt",
+                    mime="text/plain"
+                )
+
+        else:
+            # Esegui lo screener Breakout Mensile
+            df_breakout = monthly_breakout_screener(
+                tickers=filtered,
+                n_months=n_months,
+                start_date=start_str
+            )
+
+            if df_breakout.empty:
+                st.info("Nessun segnale di breakout mensile individuato.")
+            else:
+                st.success(f"Trovati {len(df_breakout)} tickers con segnale breakout mensile (ultimi {n_months} mesi):")
+                st.dataframe(df_breakout)
+
+                # Export watchlist in formato testo
+                watchlist = df_breakout['Ticker'].tolist()
+                csv_buffer = io.StringIO()
+                for t in watchlist:
+                    csv_buffer.write(t + "\n")
+                csv_data = csv_buffer.getvalue()
+
+                st.download_button(
+                    label="Scarica Tickers",
+                    data=csv_data,
+                    file_name="my_watchlist_breakout.txt",
+                    mime="text/plain"
+                )
 
     # Piccola nota/disclaimer a fondo pagina
     st.write("---")
