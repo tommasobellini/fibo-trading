@@ -11,30 +11,57 @@ import io
 
 @st.cache_data
 def get_sp500_companies():
+    """
+    Restituisce la lista dei componenti dell'S&P 500 leggendo la tabella da Wikipedia.
+    In caso di errore o mancanza di connessione, restituisce un DataFrame vuoto.
+    """
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-    tables = pd.read_html(url)
-    df = tables[0]
-    return df
+    try:
+        tables = pd.read_html(url)
+        df = tables[0]
+        return df
+    except Exception as e:
+        st.warning(f"Impossibile scaricare la lista S&P 500: {e}")
+        return pd.DataFrame()
+
+def chunk_list(lst, chunk_size=50):
+    """
+    Suddivide una lista in chunk di dimensione fissa, per evitare chiamate troppo grandi alle API di Yahoo.
+    """
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
 
 @st.cache_data
 def get_market_caps_bulk(tickers):
-    joined_tickers = " ".join(tickers)
-    bulk_obj = yf.Tickers(joined_tickers)
+    """
+    Scarica la capitalizzazione di mercato per ogni ticker in 'tickers'.
+    Utilizza un meccanismo a chunk per evitare chiamate troppo grandi a Yahoo Finance.
+    """
     caps = {}
-    for t in tickers:
-        try:
-            info = bulk_obj.tickers[t].info
-            caps[t] = info.get('marketCap', 0)
-        except Exception:
-            caps[t] = 0
+    # Suddividiamo i ticker in chunk
+    for tk_chunk in chunk_list(tickers, chunk_size=50):
+        joined_tickers = " ".join(tk_chunk)
+        bulk_obj = yf.Tickers(joined_tickers)
+        for t in tk_chunk:
+            try:
+                info = bulk_obj.tickers[t].info
+                caps[t] = info.get('marketCap', 0)
+            except Exception:
+                caps[t] = 0
     return caps
 
 def filter_stocks_by_market_cap(tickers, min_market_cap=10_000_000_000):
+    """
+    Filtra i ticker in base alla capitalizzazione minima di mercato (di default 10 mld).
+    """
     caps_dict = get_market_caps_bulk(tickers)
     filtered = [t for t in tickers if caps_dict.get(t, 0) >= min_market_cap]
     return filtered
 
 def find_previous_swing_points(df, exclude_days=5):
+    """
+    Trova i massimi e minimi precedenti, escludendo gli ultimi 'exclude_days' dati.
+    """
     if len(df) < exclude_days + 2:
         return None, None
     df_past = df.iloc[:-exclude_days]
@@ -45,6 +72,10 @@ def find_previous_swing_points(df, exclude_days=5):
     return max_price, min_price
 
 def compute_fibonacci_levels(max_price, min_price):
+    """
+    Calcola i livelli di Fibonacci principali: 0%, 23.6%, 38.2%, 50%, 61.8%, 78.6%, 100%.
+    Restituisce un dizionario con i livelli.
+    """
     if max_price is None or min_price is None:
         return {}
     diff = max_price - min_price
@@ -60,7 +91,10 @@ def compute_fibonacci_levels(max_price, min_price):
     return levels
 
 def is_near_level(current_price, target_price, tolerance=0.01):
-    # Se target_price fosse 0, evitiamo divisione per zero
+    """
+    Verifica se 'current_price' è entro +/- (tolerance * 100)% rispetto a 'target_price'.
+    Evita la divisione per zero se 'target_price' è zero.
+    """
     if target_price == 0:
         return False
     return abs(current_price - target_price) / abs(target_price) <= tolerance
@@ -69,6 +103,9 @@ def is_near_level(current_price, target_price, tolerance=0.01):
 # Indicatori classici
 ############################
 def compute_rsi(series, period=14):
+    """
+    Calcola l'RSI (Relative Strength Index) a 14 periodi di default.
+    """
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -79,6 +116,9 @@ def compute_rsi(series, period=14):
     return rsi
 
 def compute_stochastic(high, low, close, k_period=14, d_period=3):
+    """
+    Calcola lo Stocastico (K e D) con periodi di default 14 (K) e 3 (D).
+    """
     lowest_low = low.rolling(k_period).min()
     highest_high = high.rolling(k_period).max()
     stoch_k = 100 * (close - lowest_low) / (highest_high - lowest_low)
@@ -86,6 +126,10 @@ def compute_stochastic(high, low, close, k_period=14, d_period=3):
     return stoch_k, stoch_d
 
 def compute_macd(close, fastperiod=12, slowperiod=26, signalperiod=9):
+    """
+    Calcola la MACD standard con periodi di default 12 (veloce), 26 (lento) e 9 (signal).
+    Restituisce la linea macd, la linea segnale e l'istogramma.
+    """
     ema_fast = close.ewm(span=fastperiod, adjust=False).mean()
     ema_slow = close.ewm(span=slowperiod, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -113,9 +157,10 @@ def compute_dynamic_price_oscillator(df, length=33, smooth_factor=5):
     true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     vol_adj_price = true_range.ewm(span=length, adjust=False).mean()
 
-    # priceChange = close - close.shift(length)
+    # price_change = close - close.shift(length)
     price_change = close - close.shift(length)
-    # priceDelta = close - vol_adj_price
+
+    # price_delta = close - vol_adj_price
     price_delta = close - vol_adj_price
 
     # oscillator = EMA( avg(priceDelta, priceChange), smooth_factor )
@@ -140,17 +185,19 @@ def compute_dynamic_price_oscillator(df, length=33, smooth_factor=5):
 ############################
 def passes_osc_conditions(
     rsi_val, stoch_k_val, macd_val, signal_val,
-    check_rsi=True, check_stoch=True, check_macd=True
+    check_rsi=True, check_stoch=True, check_macd=True,
+    rsi_threshold=30, stoch_threshold=20
 ):
     """
     Restituisce True se il titolo passa TUTTI i filtri RSI, Stoch, MACD attivati.
+    Possibilità di personalizzare le soglie RSI e Stocastico.
     """
-    # 1) RSI oversold: rsi < 30
-    if check_rsi and rsi_val >= 30:
+    # 1) RSI oversold: rsi < rsi_threshold (default 30)
+    if check_rsi and rsi_val >= rsi_threshold:
         return False
 
-    # 2) Stoch oversold: stoch_k < 20
-    if check_stoch and stoch_k_val >= 20:
+    # 2) Stoch oversold: stoch_k < stoch_threshold (default 20)
+    if check_stoch and stoch_k_val >= stoch_threshold:
         return False
 
     # 3) MACD oversold: macd < 0 e macd < signal
@@ -165,30 +212,40 @@ def passes_dpo_condition(
 ):
     """
     dpo_mode: "Nessuna", "Oversold (DPO < BB Low)", "Overbought (DPO > BB High)"
+    Se l'utente non vuole filtrare per DPO, restituisce True.
     """
-    # Se l'utente non vuole filtrare per DPO, passiamo tutto
     if dpo_mode == "Nessuna":
         return True
     # Evitiamo errori
-    if dpo_val is None or pd.isna(dpo_val) or bb_low is None or pd.isna(bb_low) or bb_high is None or pd.isna(bb_high):
+    if (
+        dpo_val is None or pd.isna(dpo_val)
+        or bb_low is None or pd.isna(bb_low)
+        or bb_high is None or pd.isna(bb_high)
+    ):
         return False
 
+    # Logica di oversold
     if dpo_mode.startswith("Oversold") and dpo_val >= bb_low:
         return False
+
+    # Logica di overbought
     if dpo_mode.startswith("Overbought") and dpo_val <= bb_high:
         return False
+
     return True
 
 ############################
 # Funzione di entry & stop
 ############################
-def define_trade_levels(current_price, min_price):
+def define_trade_levels(current_price, min_price, stop_pct=0.01):
     """
-    Entry Price = current_price
-    Stop Price = 1% sotto min_price
+    Definisce entry e stop loss:
+    - Entry Price = current_price
+    - Stop Price = (1 - stop_pct) * min_price
+    Di default stop a -1% rispetto al minimo più recente.
     """
     entry_price = current_price
-    stop_price = min_price * 0.99
+    stop_price = min_price * (1 - stop_pct)
     return round(entry_price, 2), round(stop_price, 2)
 
 ############################
@@ -202,32 +259,47 @@ def fibonacci_screener_entry_stop(
     check_macd=True,
     dpo_mode="Nessuna",
     dpo_length=33,
-    dpo_smooth=5
+    dpo_smooth=5,
+    fib_tolerance=0.01,      # Parametro per regolare la tolleranza di vicinanza al 61.8% di Fibonacci
+    rsi_threshold=30,        # Parametro per personalizzare la soglia RSI
+    stoch_threshold=20,      # Parametro per personalizzare la soglia Stocastico
+    stop_pct=0.01            # Parametro per personalizzare la distanza dello stop dal minimo
 ):
     """
     1) Scarica ~3 mesi di dati orari
     2) Trova swing max/min precedenti (escludendo ultimi exclude_days)
-    3) Se prezzo attuale è vicino al Fib 61,8% e oversold/overbought => definisce entry e stop
+    3) Se prezzo attuale è vicino al Fib 61.8% e oversold/overbought => definisce entry e stop
     """
     end = datetime.now()
     start = end - timedelta(days=90)
 
+    # Scarichiamo i dati in blocco per tutti i ticker
+    # (Yahoo Finance permette più ticker in una singola query)
     data = yf.download(
-        tickers, 
-        start=start, 
-        end=end, 
+        tickers,
+        start=start,
+        end=end,
         interval='1h',
-        group_by="ticker"
+        group_by="ticker",
+        progress=False  # Disabilitiamo la barra di progresso di yfinance per alleggerire l'output
     )
 
     single_ticker = (len(tickers) == 1)
     results = []
 
-    for ticker in tickers:
+    # Per monitorare l'avanzamento
+    my_bar = st.progress(0)
+    total = len(tickers)
+
+    for i, ticker in enumerate(tickers):
         try:
+            # Aggiorna la barra di progresso
+            my_bar.progress((i + 1) / total)
+
             if single_ticker:
                 df_ticker = data
             else:
+                # Se i dati non sono disponibili per un ticker, saltiamo
                 if ticker not in data.columns.levels[0]:
                     continue
                 df_ticker = data[ticker]
@@ -244,7 +316,7 @@ def fibonacci_screener_entry_stop(
 
             current_price = df_ticker['Close'].iloc[-1]
 
-            # RSI, Stoch, MACD
+            # Calcolo indicatori
             close_series = df_ticker['Close']
             high_series  = df_ticker['High']
             low_series   = df_ticker['Low']
@@ -266,35 +338,36 @@ def fibonacci_screener_entry_stop(
             signal_val = signal_line.iloc[-1]
 
             # DPO
-            dpo_val = None
-            dpo_bb_low = None
-            dpo_bb_high = None
+            dpo_val      = None
+            dpo_bb_low   = None
+            dpo_bb_high  = None
 
             if dpo_mode != "Nessuna":
                 oscillator, bbHigh, bbLow, bbHighExp, bbLowExp = compute_dynamic_price_oscillator(
                     df_ticker, length=dpo_length, smooth_factor=dpo_smooth
                 )
-                # Evitiamo situazioni in cui la rolling sia troppo corta
                 if oscillator.dropna().empty or bbLow.dropna().empty or bbHigh.dropna().empty:
                     continue
-                dpo_val      = oscillator.iloc[-1]
-                dpo_bb_low   = bbLow.iloc[-1]
-                dpo_bb_high  = bbHigh.iloc[-1]
+                dpo_val     = oscillator.iloc[-1]
+                dpo_bb_low  = bbLow.iloc[-1]
+                dpo_bb_high = bbHigh.iloc[-1]
 
             # Controllo Fib 61.8%
             fib_618 = fib_levels['61.8%']
-            # Vicinanza ±1%
-            if is_near_level(current_price, fib_618, tolerance=0.01):
 
-                # Calcoliamo se passa i filtri RSI, Stoch, MACD
+            # Verifichiamo se il current_price è vicino al 61.8% di Fibonacci
+            if is_near_level(current_price, fib_618, tolerance=fib_tolerance):
+                # Filtri RSI, Stoch, MACD
                 pass_osc = passes_osc_conditions(
                     rsi_val, stoch_k_val, macd_val, signal_val,
-                    check_rsi, check_stoch, check_macd
+                    check_rsi, check_stoch, check_macd,
+                    rsi_threshold=rsi_threshold,
+                    stoch_threshold=stoch_threshold
                 )
                 if not pass_osc:
                     continue
 
-                # Calcoliamo se passa il filtro DPO (Oversold / Overbought)
+                # Filtro DPO
                 pass_dpo = passes_dpo_condition(
                     dpo_val, dpo_bb_low, dpo_bb_high,
                     dpo_mode
@@ -302,13 +375,9 @@ def fibonacci_screener_entry_stop(
                 if not pass_dpo:
                     continue
 
-                # Se tutti i filtri passano => definisci entry e stop
-                if current_price >= fib_618:
-                    fib_trend = "Bullish"
-                else:
-                    fib_trend = "Bearish"
-
-                entry_price, stop_price = define_trade_levels(current_price, min_price)
+                # Se tutti i filtri passano => definiamo entry e stop
+                fib_trend = "Bullish" if current_price >= fib_618 else "Bearish"
+                entry_price, stop_price = define_trade_levels(current_price, min_price, stop_pct=stop_pct)
 
                 results.append({
                     'Ticker': ticker,
@@ -322,16 +391,18 @@ def fibonacci_screener_entry_stop(
                     'MACD': round(macd_val, 2),
                     'Signal': round(signal_val, 2),
                     'DPO': round(dpo_val, 2) if dpo_val is not None else None,
-                    'DPO BB Low':  round(dpo_bb_low, 2) if dpo_bb_low is not None else None,
+                    'DPO BB Low': round(dpo_bb_low, 2) if dpo_bb_low is not None else None,
                     'DPO BB High': round(dpo_bb_high, 2) if dpo_bb_high is not None else None,
                     'Entry Price': entry_price,
                     'Stop Price': stop_price
                 })
 
         except Exception as e:
+            # In caso di errore su un singolo ticker, lo segnaliamo ma continuiamo
             st.warning(f"Errore su {ticker}: {e}")
             continue
 
+    my_bar.empty()  # Rimuoviamo la barra di avanzamento
     return pd.DataFrame(results)
 
 ############################
@@ -339,71 +410,7 @@ def fibonacci_screener_entry_stop(
 ############################
 def main():
     st.title("Fibonacci Screener + RSI/Stoch/MACD + DPO (oversold/overbought)")
-
-    # Parametri capitalizzazione e giorni di swing
-    min_market_cap = st.number_input("Min Market Cap", value=10_000_000_000, step=1_000_000_000)
-    exclude_days = st.number_input("Escludi ultimi N giorni (swing precedenti)", value=5, step=1)
     
-    # Flag oversold classici
-    rsi_flag = st.checkbox("RSI < 30 (Oversold)", value=True)
-    stoch_flag = st.checkbox("Stocastico < 20 (Oversold)", value=True)
-    macd_flag = st.checkbox("MACD < 0 e MACD < Signal (Oversold)", value=True)
-
-    # Filtro DPO: Nessuno, Oversold, Overbought
-    dpo_mode = st.selectbox(
-        "DPO Condition",
-        ["Nessuna", "Oversold (DPO < BB Low)", "Overbought (DPO > BB High)"],
-        index=0
-    )
-    dpo_length_val = st.number_input("DPO Length (default=33)", value=33, step=1)
-    dpo_smooth_val = st.number_input("DPO Smoothing Factor (default=5)", value=5, step=1)
-
-    if st.button("Esegui Screener"):
-        sp500_df = get_sp500_companies()
-        if sp500_df.empty:
-            st.error("Impossibile scaricare la lista S&P 500.")
-            return
-        
-        tickers = sp500_df['Symbol'].tolist()
-        # In Yahoo Finance, i ticker con punto vanno sostituiti col trattino
-        tickers = [t.replace('.', '-') for t in tickers]
-
-        filtered = filter_stocks_by_market_cap(tickers, min_market_cap)
-        st.write("Numero di ticker dopo il filtro Market Cap:", len(filtered))
-        if not filtered:
-            st.warning("Nessun ticker supera la capitalizzazione richiesta.")
-            return
-
-        df_results = fibonacci_screener_entry_stop(
-            tickers=filtered, 
-            exclude_days=exclude_days, 
-            check_rsi=rsi_flag, 
-            check_stoch=stoch_flag, 
-            check_macd=macd_flag,
-            dpo_mode=dpo_mode,
-            dpo_length=dpo_length_val,
-            dpo_smooth=dpo_smooth_val
-        )
-
-        if df_results.empty:
-            st.info("Nessun titolo rispetta i criteri selezionati.")
-        else:
-            st.success(f"Trovati {len(df_results)} titoli. Mostriamo entry e stop proposti:")
-            st.dataframe(df_results)
-
-            # Export
-            watchlist = df_results['Ticker'].tolist()
-            csv_buffer = io.StringIO()
-            for t in watchlist:
-                csv_buffer.write(t + "\n")
-            csv_data = csv_buffer.getvalue()
-
-            st.download_button(
-                label="Scarica Tickers",
-                data=csv_data,
-                file_name="my_watchlist_fib.txt",
-                mime="text/plain"
-            )
-
-if __name__ == "__main__":
-    main()
+    # Parametri principali
+    st.subheader("1) Parametri di filtraggio")
+    min_market_cap = st.number_
