@@ -129,10 +129,14 @@ def screen_stocks(
             # Get Fair Value Price (targetMeanPrice)
             fair_value_price = info.get("targetMeanPrice", np.nan)
 
+            # Get Current Price
+            current_price = info.get("regularMarketPrice", np.nan)
+
             # Check criteria
             if is_oversold(latest_rsi, rsi_threshold) and is_undervalued(pe_ratio, pe_threshold):
                 results.append({
                     "Ticker": ticker,
+                    "Current Price": round(current_price, 2) if pd.notna(current_price) else "N/A",
                     "RSI": round(latest_rsi, 2) if pd.notna(latest_rsi) else "N/A",
                     "Trailing P/E": round(pe_ratio, 2) if pd.notna(pe_ratio) else "N/A",
                     "Fair Value Price": round(fair_value_price, 2) if pd.notna(fair_value_price) else "N/A",
@@ -179,9 +183,10 @@ if start_screening:
             # Display the DataFrame
             st.dataframe(
                 screened_df.style.format({
+                    "Current Price": "${:.2f}",
                     "RSI": "{:.2f}",
                     "Trailing P/E": "{:.2f}",
-                    "Fair Value Price": "{:.2f}",
+                    "Fair Value Price": "${:.2f}",
                 }),
                 height=600,
             )
