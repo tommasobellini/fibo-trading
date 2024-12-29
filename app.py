@@ -5,7 +5,11 @@ import yfinance as yf
 import requests
 from datetime import datetime, timedelta
 from typing import List
-import time
+import logging
+
+# Configure logging
+logging.basicConfig(filename='app.log', level=logging.ERROR, 
+                    format='%(asctime)s %(levelname)s:%(message)s')
 
 # Set Streamlit page configuration
 st.set_page_config(
@@ -131,6 +135,12 @@ def screen_stocks(
 
             # Get Current Price
             current_price = info.get("regularMarketPrice", np.nan)
+            if pd.isna(current_price):
+                # Fallback to the latest Close price from historical data
+                if 'Close' in df.columns and not df['Close'].isna().all():
+                    current_price = df['Close'].iloc[-1]
+                else:
+                    current_price = np.nan
 
             # Check criteria
             if is_oversold(latest_rsi, rsi_threshold) and is_undervalued(pe_ratio, pe_threshold):
@@ -145,7 +155,8 @@ def screen_stocks(
                 })
 
         except Exception as e:
-            # Optionally, log the error or pass
+            # Log the error with ticker information
+            logging.error(f"Error processing {ticker}: {e}")
             pass
 
         # Update progress
