@@ -1,131 +1,148 @@
+# Source: @DeepCharts Youtube Channel (https://www.youtube.com/@DeepCharts)
+
 import streamlit as st
-import yfinance as yf
+import plotly.express as px
+import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
-from ta.volatility import BollingerBands
-from ta.trend import EMAIndicator
+import yfinance as yf
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
+import pytz
+import ta
 
-# Funzione per ottenere i ticker dell'S&P 500
-@st.cache_data
-def get_sp500_tickers():
-    # Fonte alternativa per ottenere i ticker, ad esempio Wikipedia
-    table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
-    df = table[0]
-    return df['Symbol'].tolist()
+##########################################################################################
+## PART 1: Define Functions for Pulling, Processing, and Creating Techincial Indicators ##
+##########################################################################################
 
-# Funzione per calcolare il DPO
-def calculate_dpo(df, length=33, smooth_factor=5):
-    if len(df) < length + 1:
-        return None
-    
-    # Calcolo True Range
-    df['prev_close'] = df['Close'].shift(1)
-    df['TR'] = df.apply(lambda row: max(row['High'] - row['Low'], 
-                                       abs(row['High'] - row['prev_close']),
-                                       abs(row['Low'] - row['prev_close'])), axis=1)
-    
-    # Calcolo volAdjPrice
-    df['volAdjPrice'] = df['TR'].ewm(span=length, adjust=False).mean()
-    
-    # Calcolo priceChange e priceDelta
-    df['priceChange'] = df['Close'] - df['Close'].shift(length)
-    df['priceDelta'] = df['Close'] - df['volAdjPrice']
-    
-    # Calcolo oscillator
-    df['oscillator'] = (df['priceDelta'] + df['priceChange']) / 2
-    df['oscillator'] = df['oscillator'].ewm(span=smooth_factor, adjust=False).mean()
-    
-    # Bollinger Bands sull'oscillator
-    bollinger = BollingerBands(close=df['oscillator'], window=length*5, window_dev=1)
-    df['bbHigh'] = bollinger.bollinger_hband()
-    df['bbLow'] = bollinger.bollinger_lband()
-    
-    bollinger_exp = BollingerBands(close=df['oscillator'], window=length*5, window_dev=2)
-    df['bbHighExp'] = bollinger_exp.bollinger_hband()
-    df['bbLowExp'] = bollinger_exp.bollinger_lband()
-    
-    # Media delle Bollinger Bands espanse
-    df['mean'] = (df['bbHighExp'] + df['bbLowExp']) / 2
-    
-    return df
-
-# Funzione per screening basato sul DPO
-def screen_stock(ticker, start_date, end_date, length=33, smooth_factor=5):
-    try:
-        df = yf.download(ticker, start=start_date, end=end_date)
-        if df.empty:
-            return None
-        df = calculate_dpo(df, length, smooth_factor)
-        if df is None:
-            return None
-        latest = df.iloc[-1]
-        
-        # Criteri di screening:
-        # Esempio: Oscillator sopra Bollinger High e sopra Bollinger High Exp
-        # oppure Oscillator sotto Bollinger Low e sotto Bollinger Low Exp
-        if (latest['oscillator'] > latest['bbHigh']) or (latest['oscillator'] < latest['bbLow']):
-            return {
-                'Ticker': ticker,
-                'Oscillator': latest['oscillator'],
-                'BB High': latest['bbHigh'],
-                'BB Low': latest['bbLow'],
-                'BB High Exp': latest['bbHighExp'],
-                'BB Low Exp': latest['bbLowExp'],
-                'Mean': latest['mean']
-            }
-        else:
-            return None
-    except Exception as e:
-        # Gestione degli errori, ad esempio ticker non valido
-        return None
-
-def main():
-    st.title("Screener SP500 basato sul Dynamic Price Oscillator (DPO)")
-    st.write("""
-        Questo applicativo utilizza l'indicatore Dynamic Price Oscillator (DPO) per eseguire uno screening delle azioni dell'S&P 500.
-        Le azioni vengono selezionate in base a criteri specifici legati all'oscillatore e alle Bollinger Bands.
-    """)
-
-    # Parametri
-    length = st.sidebar.slider("Length", min_value=10, max_value=100, value=33)
-    smooth_factor = st.sidebar.slider("Smoothing Factor", min_value=1, max_value=20, value=5)
-    start_date = st.sidebar.date_input("Data Inizio", datetime.now() - timedelta(days=365))
-    end_date = st.sidebar.date_input("Data Fine", datetime.now())
-
-    if start_date >= end_date:
-        st.sidebar.error("La data di inizio deve essere precedente alla data di fine.")
-        return
-
-    # Ottieni i ticker
-    tickers = get_sp500_tickers()
-    st.write(f"**Totale azioni nell'S&P 500:** {len(tickers)}")
-
-    # Avvia il processo di screening
-    with st.spinner("Eseguendo lo screening delle azioni..."):
-        results = []
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(screen_stock, ticker, start_date, end_date, length, smooth_factor) for ticker in tickers]
-            for future in futures:
-                res = future.result()
-                if res:
-                    results.append(res)
-
-    if results:
-        df_results = pd.DataFrame(results)
-        st.success(f"Trovate {len(df_results)} azioni che soddisfano i criteri di screening.")
-        st.dataframe(df_results)
-        # Opzione per scaricare i risultati
-        csv = df_results.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Scarica risultati in CSV",
-            data=csv,
-            file_name='sp500_dpo_screening.csv',
-            mime='text/csv',
-        )
+# Fetch stock data based on the ticker, period, and interval
+def fetch_stock_data(ticker, period, interval):
+    end_date = datetime.now()
+    if period == '1wk':
+        start_date = end_date - timedelta(days=7)
+        data = yf.download(ticker, start=start_date, end=end_date, interval=interval)
     else:
-        st.warning("Nessuna azione ha soddisfatto i criteri di screening.")
+        data = yf.download(ticker, period=period, interval=interval)
+    return data
 
-if __name__ == "__main__":
-    main()
+# Process data to ensure it is timezone-aware and has the correct format
+def process_data(data):
+    if data.index.tzinfo is None:
+        data.index = data.index.tz_localize('UTC')
+    data.index = data.index.tz_convert('US/Eastern')
+    data.reset_index(inplace=True)
+    data.rename(columns={'Date': 'Datetime'}, inplace=True)
+    return data
+
+# Calculate basic metrics from the stock data
+def calculate_metrics(data):
+    last_close = data['Close'].iloc[-1]
+    prev_close = data['Close'].iloc[0]
+    change = last_close - prev_close
+    pct_change = (change / prev_close) * 100
+    high = data['High'].max()
+    low = data['Low'].min()
+    volume = data['Volume'].sum()
+    return last_close, change, pct_change, high, low, volume
+
+# Add simple moving average (SMA) and exponential moving average (EMA) indicators
+def add_technical_indicators(data):
+    data['SMA_20'] = ta.trend.sma_indicator(data['Close'], window=20)
+    data['EMA_20'] = ta.trend.ema_indicator(data['Close'], window=20)
+    return data
+
+###############################################
+## PART 2: Creating the Dashboard App layout ##
+###############################################
+
+
+# Set up Streamlit page layout
+st.set_page_config(layout="wide")
+st.title('Real Time Stock Dashboard')
+
+
+# 2A: SIDEBAR PARAMETERS ############
+
+# Sidebar for user input parameters
+st.sidebar.header('Chart Parameters')
+ticker = st.sidebar.text_input('Ticker', 'ADBE')
+time_period = st.sidebar.selectbox('Time Period', ['1d', '1wk', '1mo', '1y', 'max'])
+chart_type = st.sidebar.selectbox('Chart Type', ['Candlestick', 'Line'])
+indicators = st.sidebar.multiselect('Technical Indicators', ['SMA 20', 'EMA 20'])
+
+# Mapping of time periods to data intervals
+interval_mapping = {
+    '1d': '1m',
+    '1wk': '30m',
+    '1mo': '1d',
+    '1y': '1wk',
+    'max': '1wk'
+}
+
+
+# 2B: MAIN CONTENT AREA ############
+
+# Update the dashboard based on user input
+if st.sidebar.button('Update'):
+    data = fetch_stock_data(ticker, time_period, interval_mapping[time_period])
+    data = process_data(data)
+    data = add_technical_indicators(data)
+    
+    last_close, change, pct_change, high, low, volume = calculate_metrics(data)
+    
+    # Display main metrics
+    st.metric(label=f"{ticker} Last Price", value=f"{last_close:.2f} USD", delta=f"{change:.2f} ({pct_change:.2f}%)")
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("High", f"{high:.2f} USD")
+    col2.metric("Low", f"{low:.2f} USD")
+    col3.metric("Volume", f"{volume:,}")
+    
+    # Plot the stock price chart
+    fig = go.Figure()
+    if chart_type == 'Candlestick':
+        fig.add_trace(go.Candlestick(x=data['Datetime'],
+                                     open=data['Open'],
+                                     high=data['High'],
+                                     low=data['Low'],
+                                     close=data['Close']))
+    else:
+        fig = px.line(data, x='Datetime', y='Close')
+    
+    # Add selected technical indicators to the chart
+    for indicator in indicators:
+        if indicator == 'SMA 20':
+            fig.add_trace(go.Scatter(x=data['Datetime'], y=data['SMA_20'], name='SMA 20'))
+        elif indicator == 'EMA 20':
+            fig.add_trace(go.Scatter(x=data['Datetime'], y=data['EMA_20'], name='EMA 20'))
+    
+    # Format graph
+    fig.update_layout(title=f'{ticker} {time_period.upper()} Chart',
+                      xaxis_title='Time',
+                      yaxis_title='Price (USD)',
+                      height=600)
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Display historical data and technical indicators
+    st.subheader('Historical Data')
+    st.dataframe(data[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']])
+    
+    st.subheader('Technical Indicators')
+    st.dataframe(data[['Datetime', 'SMA_20', 'EMA_20']])
+
+
+# 2C: SIDEBAR PRICES ############
+
+# Sidebar section for real-time stock prices of selected symbols
+st.sidebar.header('Real-Time Stock Prices')
+stock_symbols = ['AAPL', 'GOOGL', 'AMZN', 'MSFT']
+for symbol in stock_symbols:
+    real_time_data = fetch_stock_data(symbol, '1d', '1m')
+    if not real_time_data.empty:
+        real_time_data = process_data(real_time_data)
+        last_price = real_time_data['Close'].iloc[-1]
+        change = last_price - real_time_data['Open'].iloc[0]
+        pct_change = (change / real_time_data['Open'].iloc[0]) * 100
+        st.sidebar.metric(f"{symbol}", f"{last_price:.2f} USD", f"{change:.2f} ({pct_change:.2f}%)")
+
+# Sidebar information section
+st.sidebar.subheader('About')
+st.sidebar.info('This dashboard provides stock data and technical indicators for various time periods. Use the sidebar to customize your view.')
