@@ -23,45 +23,65 @@ def calculate_supertrend(df, period=10, multiplier=3):
     - multiplier: ATR multiplier
 
     Returns:
-    - df: DataFrame with SuperTrend columns added
+    - df: DataFrame with SuperTrend and Trend columns added
     """
     df = df.copy()
+    
+    # Calculate True Range (TR)
+    df['TR'] = np.maximum(df['High'] - df['Low'],
+                         np.maximum(abs(df['High'] - df['Close'].shift(1)),
+                                    abs(df['Low'] - df['Close'].shift(1))))
+    
     # Calculate ATR
-    df['ATR'] = df['High'].rolling(window=period).max() - df['Low'].rolling(window=period).min()
-    df['ATR'] = df['ATR'].rolling(window=period).mean()
-
-    # Calculate basic upper and lower bands
-    hl2 = (df['High'] + df['Low']) / 2
-    df['Upper Basic'] = hl2 + (multiplier * df['ATR'])
-    df['Lower Basic'] = hl2 - (multiplier * df['ATR'])
-
-    # Initialize Upper Band and Lower Band
-    df['Upper Band'] = df[['Upper Basic', 'Close']].apply(
-        lambda x: min(x['Upper Basic'], x['Close']) if x['Close'] < x['Upper Basic'] else x['Upper Basic'], axis=1)
-    df['Lower Band'] = df[['Lower Basic', 'Close']].apply(
-        lambda x: max(x['Lower Basic'], x['Close']) if x['Close'] > x['Lower Basic'] else x['Lower Basic'], axis=1)
-
-    # Initialize SuperTrend
+    df['ATR'] = df['TR'].rolling(window=period, min_periods=1).mean()
+    
+    # Calculate Basic Upper and Lower Bands
+    df['Upper Basic'] = (df['High'] + df['Low']) / 2 + (multiplier * df['ATR'])
+    df['Lower Basic'] = (df['High'] + df['Low']) / 2 - (multiplier * df['ATR'])
+    
+    # Initialize Final Upper and Lower Bands
+    df['Upper Band'] = df['Upper Basic']
+    df['Lower Band'] = df['Lower Basic']
+    
+    # Initialize SuperTrend and Trend
     df['SuperTrend'] = np.nan
-    trend = True  # True for uptrend, False for downtrend
-
+    df['Trend'] = np.nan
+    
     for current in range(1, len(df)):
-        previous = current - 1
-
-        if pd.isna(df['SuperTrend'][previous]):
-            df.at[current, 'SuperTrend'] = df.at[current, 'Lower Band']
-            continue
-
-        if df.at[current, 'Close'] > df.at[previous, 'SuperTrend']:
-            trend = True
-        elif df.at[current, 'Close'] < df.at[previous, 'SuperTrend']:
-            trend = False
-
-        if trend:
-            df.at[current, 'SuperTrend'] = df.at[current, 'Lower Band']
+        # Previous values
+        prev_close = df['Close'].iloc[current - 1]
+        prev_supertrend = df['SuperTrend'].iloc[current - 1]
+        prev_upper_band = df['Upper Band'].iloc[current - 1]
+        prev_lower_band = df['Lower Band'].iloc[current - 1]
+        
+        # Current Upper and Lower Bands
+        current_upper_band = df['Upper Basic'].iloc[current]
+        current_lower_band = df['Lower Basic'].iloc[current]
+        
+        # Adjust the Upper and Lower Bands
+        if current_upper_band < prev_upper_band or prev_close > prev_upper_band:
+            df.at[current, 'Upper Band'] = current_upper_band
         else:
-            df.at[current, 'SuperTrend'] = df.at[current, 'Upper Band']
-
+            df.at[current, 'Upper Band'] = prev_upper_band
+        
+        if current_lower_band > prev_lower_band or prev_close < prev_lower_band:
+            df.at[current, 'Lower Band'] = current_lower_band
+        else:
+            df.at[current, 'Lower Band'] = prev_lower_band
+        
+        # Determine Trend
+        if df['Close'].iloc[current] > prev_supertrend:
+            trend = 'Uptrend'
+            df.at[current, 'SuperTrend'] = df['Lower Band'].iloc[current]
+        elif df['Close'].iloc[current] < prev_supertrend:
+            trend = 'Downtrend'
+            df.at[current, 'SuperTrend'] = df['Upper Band'].iloc[current]
+        else:
+            trend = df['Trend'].iloc[current - 1]
+            df.at[current, 'SuperTrend'] = df['SuperTrend'].iloc[current - 1]
+        
+        df.at[current, 'Trend'] = trend
+    
     return df
 
 @st.cache(allow_output_mutation=True)
@@ -103,8 +123,11 @@ def calculate_fibonacci_levels(df, lookback=100, selected_levels=None):
     diff = max_price - min_price
     levels = {}
     for level in selected_levels:
-        percentage = float(level.strip('%')) / 100
-        levels[level] = max_price - percentage * diff
+        try:
+            percentage = float(level.strip('%')) / 100
+            levels[level] = max_price - percentage * diff
+        except:
+            continue
     return levels
 
 def apply_strategy(df, fib_levels, fib_tolerance=0.01):
@@ -238,7 +261,7 @@ def main():
         step=0.5
     )
 
-    # Option to select whether to include Buy, Sell signals
+    # Signal Selection
     st.sidebar.subheader("📊 Signal Selection")
     include_buy = st.sidebar.checkbox("Include Buy Signals", value=True)
     include_sell = st.sidebar.checkbox("Include Sell Signals", value=True)
@@ -309,4 +332,4 @@ def main():
     st.markdown("**Disclaimer**: This tool is for educational purposes only and does not constitute financial advice. Always do your own research before making any investment decisions.")
 
 if __name__ == "__main__":
-    main()
+        main()
