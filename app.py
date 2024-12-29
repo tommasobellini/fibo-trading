@@ -30,9 +30,9 @@ def get_sp500_tickers():
 
 @st.cache_data(ttl=3600)
 def fetch_data(ticker, start, end):
-    """Fetch historical data for a given ticker."""
+    """Fetch historical data for a given ticker with weekly interval."""
     try:
-        data = yf.download(ticker, start=start, end=end, progress=False)
+        data = yf.download(ticker, start=start, end=end, interval='1wk', progress=False)
         if data.empty:
             return None
         data.reset_index(inplace=True)
@@ -80,6 +80,8 @@ def calculate_supertrend(df, length, factor):
 
 def perform_kmeans(data, n_clusters=3, max_iter=1000):
     """Perform K-means clustering."""
+    if len(data) < n_clusters:
+        n_clusters = len(data)
     kmeans = KMeans(n_clusters=n_clusters, max_iter=max_iter, random_state=42)
     kmeans.fit(data.reshape(-1, 1))
     return kmeans.labels_, kmeans.cluster_centers_
@@ -90,15 +92,30 @@ def calculate_bull_market_support_band(df, sma_length=20, ema_length=21):
     df['Weekly_EMA'] = df['Close'].ewm(span=ema_length, adjust=False).mean()
     return df
 
+def calculate_perf(df, perf_alpha):
+    """Calculate performance index similar to Pine Script."""
+    df['Close_diff'] = df['Close'].diff().fillna(0)
+    df['Diff_sign'] = np.sign(df['Close_diff'])
+    # Initialize perf
+    df['Perf'] = 0.0
+    alpha = 2 / (perf_alpha + 1)
+    for i in range(1, len(df)):
+        df.at[i, 'Perf'] = df.at[i-1, 'Perf'] + alpha * (df.at[i, 'Close_diff'] * df.at[i, 'Diff_sign'] - df.at[i-1, 'Perf'])
+    return df['Perf']
+
 def generate_signals(df, supertrend_col='SuperTrend', trend_col='Trend'):
     """Generate buy and sell signals based on SuperTrend."""
     df['Signal'] = 0
-    df['Signal'][1:] = np.where(df[trend_col][1:] > df[trend_col][:-1], 1, 
-                                np.where(df[trend_col][1:] < df[trend_col][:-1], -1, 0))
+    df['Signal'] = df[trend_col].diff()
+    df['Signal'] = df['Signal'].apply(lambda x: 1 if x == 1 else (-1 if x == -1 else 0))
     return df
 
 def apply_trading_strategy(df, atr_length, min_mult, max_mult, step, perf_alpha, from_cluster, max_iter, max_data):
     """Apply the SuperTrend AI (Clustering) and Bull Market Support Band strategy."""
+    # Limit data to the most recent 'max_data' bars
+    if max_data and len(df) > max_data:
+        df = df.tail(max_data).reset_index(drop=True)
+    
     # Calculate ATR
     df = calculate_atr(df, atr_length)
     
@@ -111,9 +128,8 @@ def apply_trading_strategy(df, atr_length, min_mult, max_mult, step, perf_alpha,
     # Calculate SuperTrend for multiple factors
     for factor in factors:
         temp_df = calculate_supertrend(df.copy(), atr_length, factor)
-        temp_df['Perf'] = temp_df['Close'].diff().fillna(0) * np.sign(df['Close'].diff().fillna(0))
-        perf = temp_df['Perf'].ewm(span=perf_alpha, adjust=False).mean()
-        supertrend_dict[factor] = perf
+        temp_df['Perf'] = calculate_perf(temp_df, perf_alpha)
+        supertrend_dict[factor] = temp_df['Perf']
     
     # Prepare data for clustering
     perf_values = []
@@ -125,33 +141,44 @@ def apply_trading_strategy(df, atr_length, min_mult, max_mult, step, perf_alpha,
     
     perf_array = np.array(perf_values).reshape(-1, 1)
     
-    # Perform K-means clustering
-    labels, centers = perform_kmeans(perf_array.flatten(), n_clusters=3, max_iter=max_iter)
-    
-    cluster_info = {}
-    for i in range(3):
-        cluster_info[i] = {
-            'perf': perf_array[labels == i],
-            'factor': np.array(factor_values)[labels == i]
-        }
-    
-    # Select target cluster
-    if from_cluster == "Best":
-        target_cluster = np.argmax(centers)
-    elif from_cluster == "Average":
-        target_cluster = 1  # Assuming 3 clusters: 0-Worst, 1-Average, 2-Best
+    # Check if perf_array has sufficient variation
+    if np.std(perf_array) == 0:
+        # All perf values are the same, skip clustering
+        target_factor = min_mult
     else:
-        target_cluster = np.argmin(centers)
-    
-    target_factors = cluster_info[target_cluster]['factor']
-    target_factor = target_factors.mean() if len(target_factors) > 0 else min_mult
+        # Perform K-means clustering
+        labels, centers = perform_kmeans(perf_array.flatten(), n_clusters=3, max_iter=max_iter)
+        
+        cluster_info = {}
+        for i in range(len(centers)):
+            cluster_info[i] = {
+                'perf': perf_array[labels == i],
+                'factor': np.array(factor_values)[labels == i]
+            }
+        
+        # Select target cluster
+        if from_cluster == "Best":
+            target_cluster = np.argmax(centers)
+        elif from_cluster == "Average":
+            if len(centers) >=2:
+                target_cluster = 1  # Middle cluster
+            else:
+                target_cluster = 0
+        else:
+            target_cluster = np.argmin(centers)
+        
+        target_factors = cluster_info[target_cluster]['factor']
+        target_factor = target_factors.mean() if len(target_factors) > 0 else min_mult
     
     # Calculate SuperTrend with target factor
     df = calculate_supertrend(df, atr_length, target_factor)
     
+    # Recalculate Perf with target SuperTrend
+    df['Perf'] = calculate_perf(df, perf_alpha)
+    
     # Calculate Performance Index (perf_idx)
     den = df['Close'].diff().abs().ewm(span=perf_alpha, adjust=False).mean()
-    perf_idx = cluster_info[target_cluster]['perf'].mean() / den.iloc[-1] if den.iloc[-1] != 0 else 0
+    perf_idx = df['Perf'].iloc[-1] / den.iloc[-1] if den.iloc[-1] != 0 else 0
     
     # Calculate Trailing Stop Adaptive MA
     df['TS'] = df['SuperTrend']
@@ -193,7 +220,7 @@ def main():
     
     # Optimization Settings
     max_iter = st.sidebar.number_input("Maximum Iteration Steps", min_value=1, value=1000, step=100)
-    max_data = st.sidebar.number_input("Historical Bars Calculation", min_value=1, value=10000, step=1000)
+    max_data = st.sidebar.number_input("Historical Bars Calculation", min_value=1, value=1000, step=100)  # Reduced to 1000 for performance
     
     # Screening Settings
     st.sidebar.subheader("Screening Options")
@@ -201,8 +228,12 @@ def main():
     
     # Fetch S&P 500 tickers
     st.header("Fetching S&P 500 Tickers...")
-    tickers = get_sp500_tickers()
-    st.success(f"Retrieved {len(tickers)} tickers.")
+    try:
+        tickers = get_sp500_tickers()
+        st.success(f"Retrieved {len(tickers)} tickers.")
+    except Exception as e:
+        st.error(f"Error fetching tickers: {e}")
+        st.stop()
     
     # Date Range
     end_date = datetime.now()
@@ -239,6 +270,7 @@ def main():
     # Use ThreadPoolExecutor for concurrent processing
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_ticker = {executor.submit(process_ticker, ticker): ticker for ticker in tickers}
+        total = len(tickers)
         for idx, future in enumerate(future_to_ticker):
             ticker = future_to_ticker[future]
             try:
@@ -247,14 +279,17 @@ def main():
                     results.append(result)
             except Exception as e:
                 pass
-            progress_bar.progress((idx + 1) / len(tickers))
-            status_text.text(f"Processing {idx + 1} of {len(tickers)} tickers...")
+            progress_bar.progress((idx + 1) / total)
+            status_text.text(f"Processing {idx + 1} of {total} tickers...")
     
     progress_bar.empty()
     status_text.empty()
     
     # Create DataFrame from results
-    results_df = pd.DataFrame(results, columns=['Ticker', 'Signal'])
+    if results:
+        results_df = pd.DataFrame(results, columns=['Ticker', 'Signal'])
+    else:
+        results_df = pd.DataFrame(columns=['Ticker', 'Signal'])
     
     # Apply Signal Filter
     if signal_filter == "Buy":
