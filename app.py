@@ -28,7 +28,6 @@ rsi_threshold = st.sidebar.number_input(
     value=30,
     step=1,
 )
-
 pe_threshold = st.sidebar.number_input(
     "P/E Ratio Maximum (Default: 15)",
     min_value=5.0,
@@ -36,7 +35,6 @@ pe_threshold = st.sidebar.number_input(
     value=15.0,
     step=0.5,
 )
-
 lookback_days = st.sidebar.number_input(
     "Lookback Period (Days, Default: 90)",
     min_value=30,
@@ -128,12 +126,16 @@ def screen_stocks(
             # Get trailing P/E ratio
             pe_ratio = info.get("trailingPE", np.nan)
 
+            # Get Fair Value Price (targetMeanPrice)
+            fair_value_price = info.get("targetMeanPrice", np.nan)
+
             # Check criteria
             if is_oversold(latest_rsi, rsi_threshold) and is_undervalued(pe_ratio, pe_threshold):
                 results.append({
                     "Ticker": ticker,
                     "RSI": round(latest_rsi, 2) if pd.notna(latest_rsi) else "N/A",
                     "Trailing P/E": round(pe_ratio, 2) if pd.notna(pe_ratio) else "N/A",
+                    "Fair Value Price": round(fair_value_price, 2) if pd.notna(fair_value_price) else "N/A",
                     "Company Name": info.get("shortName", "N/A"),
                     "Sector": info.get("sector", "N/A"),
                 })
@@ -179,6 +181,7 @@ if start_screening:
                 screened_df.style.format({
                     "RSI": "{:.2f}",
                     "Trailing P/E": "{:.2f}",
+                    "Fair Value Price": "{:.2f}",
                 }),
                 height=600,
             )
