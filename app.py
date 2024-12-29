@@ -136,10 +136,10 @@ def screen_stocks(
             if is_oversold(latest_rsi, rsi_threshold) and is_undervalued(pe_ratio, pe_threshold):
                 results.append({
                     "Ticker": ticker,
-                    "Current Price": round(current_price, 2) if pd.notna(current_price) else "N/A",
-                    "RSI": round(latest_rsi, 2) if pd.notna(latest_rsi) else "N/A",
-                    "Trailing P/E": round(pe_ratio, 2) if pd.notna(pe_ratio) else "N/A",
-                    "Fair Value Price": round(fair_value_price, 2) if pd.notna(fair_value_price) else "N/A",
+                    "Current Price": round(current_price, 2) if pd.notna(current_price) else np.nan,
+                    "RSI": round(latest_rsi, 2) if pd.notna(latest_rsi) else np.nan,
+                    "Trailing P/E": round(pe_ratio, 2) if pd.notna(pe_ratio) else np.nan,
+                    "Fair Value Price": round(fair_value_price, 2) if pd.notna(fair_value_price) else np.nan,
                     "Company Name": info.get("shortName", "N/A"),
                     "Sector": info.get("sector", "N/A"),
                 })
