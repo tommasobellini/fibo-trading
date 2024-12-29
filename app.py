@@ -1,382 +1,280 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import requests
-from datetime import datetime, timedelta
-from typing import List
-import logging
-from scipy.signal import hilbert
-
-# Configure logging
-logging.basicConfig(
-    filename='app.log',
-    level=logging.ERROR,
-    format='%(asctime)s %(levelname)s:%(message)s'
-)
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 # Set Streamlit page configuration
 st.set_page_config(
-    page_title="S&P 500 Stock Screener with Cycle Analysis",
+    page_title="S&P 500 Dynamic Price Oscillator (DPO) Strategy",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # Title of the app
-st.title("📈 S&P 500 Stock Screener: Undervalued & Oversold Stocks with Cycle Analysis")
+st.title("📈 S&P 500 Dynamic Price Oscillator (DPO) Strategy")
 
 # Sidebar for user inputs
-st.sidebar.header("Screening Parameters")
+st.sidebar.header("🔧 Parameters")
 
-# User inputs for RSI, P/E, Lookback
-rsi_threshold = st.sidebar.number_input(
-    "RSI Oversold Threshold (Default: 30)",
-    min_value=10,
-    max_value=50,
-    value=30,
-    step=1,
-)
+def user_input_features():
+    start_date = st.sidebar.date_input("Start Date", value=datetime(2020,1,1))
+    end_date = st.sidebar.date_input("End Date", value=datetime.today())
+    dpo_period = st.sidebar.number_input("DPO Period", min_value=1, max_value=100, value=20, step=1)
+    initial_cash = st.sidebar.number_input("Initial Cash ($)", min_value=1000, value=10000, step=100)
+    analysis_type = st.sidebar.selectbox("Analysis Type", options=["Aggregate Performance", "Individual Stock Analysis"])
+    return start_date, end_date, dpo_period, initial_cash, analysis_type
 
-pe_threshold = st.sidebar.number_input(
-    "P/E Ratio Maximum (Default: 15)",
-    min_value=5.0,
-    max_value=50.0,
-    value=15.0,
-    step=0.5,
-)
-
-lookback_days = st.sidebar.number_input(
-    "Lookback Period (Days, Default: 90)",
-    min_value=30,
-    max_value=365,
-    value=90,
-    step=30,
-)
-
-# User inputs for DPO parameters
-dpo_length = st.sidebar.number_input(
-    "DPO Lookback Length (Default: 33)",
-    min_value=1,
-    max_value=100,
-    value=33,
-    step=1,
-)
-
-dpo_smooth_factor = st.sidebar.number_input(
-    "DPO Smoothing Factor (Default: 5)",
-    min_value=1,
-    max_value=50,
-    value=5,
-    step=1,
-)
-
-# Button to start screening
-start_screening = st.sidebar.button("Start Screening")
+start_date, end_date, dpo_period, initial_cash, analysis_type = user_input_features()
 
 # Function to fetch S&P 500 tickers
+@st.cache_data
+def get_sp500_tickers():
+    # Fetch the list from Wikipedia
+    try:
+        tables = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+        df = tables[0]
+        tickers = df['Symbol'].str.replace('.', '-', regex=False).tolist()  # Adjust tickers for yfinance
+        return tickers
+    except Exception as e:
+        st.error("Error fetching S&P 500 tickers.")
+        return []
+
+sp500_tickers = get_sp500_tickers()
+st.sidebar.markdown(f"**Total S&P 500 Stocks:** {len(sp500_tickers)}")
+
+# Option to select specific stocks or analyze all
+if analysis_type == "Individual Stock Analysis":
+    selected_tickers = st.sidebar.multiselect("Select Stock(s) for Analysis", options=sp500_tickers, default=["AAPL", "MSFT", "GOOGL"])
+else:
+    selected_tickers = sp500_tickers  # All tickers
+
+st.subheader(f"📊 Selected Stocks for DPO Strategy: {len(selected_tickers)}")
+
+# Function to load data for a single ticker
 @st.cache_data(show_spinner=False)
-def fetch_sp500_tickers() -> List[str]:
-    """
-    Fetch S&P 500 tickers from Wikipedia.
-    Returns a list of ticker symbols.
-    """
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    response = requests.get(url)
-    response.raise_for_status()
-    html = response.text
+def load_data(ticker, start, end):
+    try:
+        data = yf.download(ticker, start=start, end=end, progress=False)
+        if data.empty:
+            return None
+        data.dropna(inplace=True)
+        data['Ticker'] = ticker
+        return data
+    except Exception as e:
+        return None
 
-    # Parse the HTML table using pandas
-    sp500_table = pd.read_html(html, attrs={"id": "constituents"})[0]
-    tickers = sp500_table["Symbol"].tolist()
-    # Convert tickers to Yahoo Finance format
-    tickers = [ticker.replace(".", "-") for ticker in tickers]
-    return tickers
-
-# Function to calculate True Range
-def calculate_true_range(high, low, close):
-    """
-    Calculate True Range (TR).
-    TR = max(high - low, abs(high - previous close), abs(low - previous close))
-    """
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
-
-# Function to calculate Bollinger Bands
-def calculate_bollinger_bands(src, length, mult):
-    """
-    Calculate Bollinger Bands.
-    """
-    basis = src.rolling(window=length, min_periods=1).mean()
-    dev = mult * src.rolling(window=length, min_periods=1).std()
-    upper = basis + dev
-    lower = basis - dev
-    return upper, lower
-
-# Function to calculate Dynamic Price Oscillator
-def calculate_dynamic_price_oscillator(df, length=33, smooth_factor=5):
-    """
-    Calculate the Dynamic Price Oscillator and Bollinger Bands.
-    Adds oscillator and Bollinger Bands columns to the DataFrame.
-    
-    Parameters:
-    - df: DataFrame with 'High', 'Low', 'Close' columns.
-    - length: Lookback period for calculations.
-    - smooth_factor: Smoothing factor for EMA.
-    
-    Returns:
-    - df: DataFrame with added oscillator and Bollinger Bands columns.
-    """
-    # Calculate True Range
-    df['True_Range'] = calculate_true_range(df['High'], df['Low'], df['Close'])
-    
-    # Volume-Adjusted Price (EMA of True Range)
-    df['VolAdjPrice'] = df['True_Range'].ewm(span=length, adjust=False).mean()
-    
-    # Price Change and Price Delta
-    df['PriceChange'] = df['Close'] - df['Close'].shift(length)
-    df['PriceDelta'] = df['Close'] - df['VolAdjPrice']
-    
-    # Oscillator Calculation
-    df['Oscillator'] = (df['PriceDelta'].combine(df['PriceChange'], func=lambda x, y: np.nan if np.isnan(x) or np.isnan(y) else (x + y) / 2)).ewm(span=smooth_factor, adjust=False).mean()
-    
-    # Bollinger Bands on Oscillator
-    boll_length = length * 5
-    df['BB_High'], df['BB_Low'] = calculate_bollinger_bands(df['Oscillator'], boll_length, 1)
-    df['BB_HighExp'], df['BB_LowExp'] = calculate_bollinger_bands(df['Oscillator'], boll_length, 2)
-    df['Mean'] = (df['BB_HighExp'] + df['BB_LowExp']) / 2
-    
+# Function to calculate DPO
+def calculate_dpo(df, period):
+    shift = int(period / 2 + 1)
+    sma = df['Close'].rolling(window=period).mean()
+    dpo = df['Close'] - sma.shift(shift)
+    df['DPO'] = dpo
     return df
 
-# Function to calculate RSI
-def calculate_RSI(series: pd.Series, period: int = 14) -> pd.Series:
-    """
-    Calculate the Relative Strength Index (RSI) for a given price series.
-    """
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0).rolling(window=period, min_periods=1).mean()
-    loss = -delta.where(delta < 0, 0).rolling(window=period, min_periods=1).mean()
-    # Prevent division by zero
-    loss = loss.replace(0, 1e-10)
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-# Function to calculate Cycle Oscillator using Hilbert Transform
-def calculate_cycle_oscillator(df, close_column='Close'):
-    """
-    Calculate the Cycle Oscillator using Hilbert Transform.
-    
-    Parameters:
-    - df: DataFrame with price data.
-    - close_column: Column name for closing prices.
-    
-    Returns:
-    - df: DataFrame with added 'Cycle' and 'Cycle_Period' columns.
-    """
-    # Compute the analytic signal
-    analytic_signal = hilbert(df[close_column].fillna(method='ffill'))
-    # Compute the instantaneous phase
-    instantaneous_phase = np.unwrap(np.angle(analytic_signal))
-    # Compute the instantaneous frequency
-    instantaneous_frequency = np.diff(instantaneous_phase) / (2.0*np.pi) * 252  # Annualize frequency
-    # Pad the frequency array to match the length
-    instantaneous_frequency = np.concatenate(([instantaneous_frequency[0]], instantaneous_frequency))
-    # Compute the cycle period
-    cycle_period = 1 / instantaneous_frequency
-    # Add cycle and cycle period to DataFrame
-    df['Cycle'] = cycle_period
-    df['Cycle_Period'] = cycle_period
+# Function to generate signals
+def generate_signals(df):
+    df['Signal'] = 0
+    df['Signal'] = np.where((df['DPO'] > 0) & (df['DPO'].shift(1) <= 0), 1, df['Signal'])
+    df['Signal'] = np.where((df['DPO'] < 0) & (df['DPO'].shift(1) >= 0), -1, df['Signal'])
     return df
 
-# Function to check if oscillator is below Bollinger Bands
-def is_oscillator_below_bbands(df):
-    """
-    Check if oscillator is below the lower Bollinger Bands.
-    Returns True if oscillator is below BB_Low or BB_LowExp.
-    """
-    return (df['Oscillator'] < df['BB_Low']) | (df['Oscillator'] < df['BB_LowExp'])
+# Function to backtest strategy
+def backtest_strategy(df, initial_cash):
+    cash = initial_cash
+    position = 0  # Number of shares
+    portfolio = []  # Portfolio value over time
 
-# Function to check oversold condition
-def is_oversold(rsi_value: float, threshold: float) -> bool:
-    return rsi_value < threshold
+    for index, row in df.iterrows():
+        # Buy signal
+        if row['Signal'] == 1 and cash > 0:
+            position = cash / row['Close']
+            cash = 0
+        # Sell signal
+        elif row['Signal'] == -1 and position > 0:
+            cash = position * row['Close']
+            position = 0
+        # Calculate portfolio value
+        portfolio_value = cash + position * row['Close']
+        portfolio.append(portfolio_value)
 
-# Function to check undervalued condition
-def is_undervalued(pe_ratio: float, max_pe: float) -> bool:
-    if pd.isna(pe_ratio) or pe_ratio <= 0:
-        return False
-    return pe_ratio < max_pe
-
-# Function to generate buy and sell signals based on cycles
-def generate_cycle_signals(df):
-    """
-    Generate buy and sell signals based on the Cycle Oscillator.
-    
-    Parameters:
-    - df: DataFrame with 'Oscillator' and 'Cycle' columns.
-    
-    Returns:
-    - df: DataFrame with added 'Cycle_Signal' column.
-    """
-    df['Cycle_Signal'] = 0
-    # Buy Signal: Oscillator crosses above BB_Low or BB_LowExp
-    df['Cycle_Signal'][(df['Oscillator'] < df['BB_Low']) & (df['Oscillator'].shift(1) >= df['BB_Low'].shift(1))] = 1
-    df['Cycle_Signal'][(df['Oscillator'] > df['BB_High']) & (df['Oscillator'].shift(1) <= df['BB_High'].shift(1))] = -1
+    df['Portfolio Value'] = portfolio
     return df
 
-# Main screening function
-def screen_stocks(
-    tickers: List[str],
-    rsi_threshold: float,
-    pe_threshold: float,
-    lookback_days: int,
-    dpo_length: int,
-    dpo_smooth_factor: int
-) -> pd.DataFrame:
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=lookback_days)
-    
+# Function to process a single ticker
+def process_ticker(ticker, start, end, period, initial_cash):
+    data = load_data(ticker, start, end)
+    if data is None:
+        return None
+    data = calculate_dpo(data, period)
+    data = generate_signals(data)
+    data = backtest_strategy(data, initial_cash)
+    final_portfolio = data['Portfolio Value'].iloc[-1]
+    profit = final_portfolio - initial_cash
+    roi = (profit / initial_cash) * 100
+    return {
+        'Ticker': ticker,
+        'Initial Cash': initial_cash,
+        'Final Portfolio Value': final_portfolio,
+        'Profit': profit,
+        'ROI (%)': roi
+    }
+
+# Display progress
+progress_bar = st.progress(0)
+status_text = st.empty()
+
+# Function to update progress
+def update_progress(count, total):
+    progress = count / total
+    progress_bar.progress(progress)
+    status_text.text(f"Processing {count} of {total} stocks...")
+
+# Use multiprocessing for faster processing
+def run_backtest(tickers, start, end, period, initial_cash):
     results = []
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
     total = len(tickers)
-    
-    for idx, ticker in enumerate(tickers):
-        try:
-            # Fetch historical price data
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-            if df.empty:
-                continue
-            
-            # Ensure necessary columns are present
-            if not {'High', 'Low', 'Close'}.issubset(df.columns):
-                continue
-            
-            # Calculate RSI
-            df['RSI'] = calculate_RSI(df['Close'])
-            
-            # Calculate Dynamic Price Oscillator
-            df = calculate_dynamic_price_oscillator(df, length=dpo_length, smooth_factor=dpo_smooth_factor)
-            
-            # Calculate Cycle Oscillator
-            df = calculate_cycle_oscillator(df, close_column='Close')
-            
-            # Generate Cycle Signals
-            df = generate_cycle_signals(df)
-            
-            # Get the latest RSI, Oscillator, and Cycle Signal values
-            latest_rsi = df['RSI'].iloc[-1] if not df['RSI'].isna().all() else np.nan
-            latest_oscillator = df['Oscillator'].iloc[-1] if not df['Oscillator'].isna().all() else np.nan
-            latest_cycle_signal = df['Cycle_Signal'].iloc[-1] if not df['Cycle_Signal'].isna().all() else 0
-            
-            # Check cycle condition (buy signal)
-            cycle_condition = latest_cycle_signal == 1  # Modify as per strategy
-            
-            # Fetch fundamental data
-            ticker_obj = yf.Ticker(ticker)
-            info = ticker_obj.info
-            
-            # Get trailing P/E ratio
-            pe_ratio = info.get("trailingPE", np.nan)
-            
-            # Get Fair Value Price (targetMeanPrice)
-            fair_value_price = info.get("targetMeanPrice", np.nan)
-            
-            # Get Current Price with fallback
-            current_price = info.get("regularMarketPrice", np.nan)
-            if pd.isna(current_price):
-                # Fallback to the latest Close price from historical data
-                if 'Close' in df.columns and not df['Close'].isna().all():
-                    current_price = df['Close'].iloc[-1]
-                else:
-                    current_price = np.nan
-            
-            # Check combined criteria
-            if (is_oversold(latest_rsi, rsi_threshold) and
-                is_undervalued(pe_ratio, pe_threshold) and
-                cycle_condition):
-                
-                results.append({
-                    "Ticker": ticker,
-                    "Current Price": round(current_price, 2) if pd.notna(current_price) else np.nan,
-                    "RSI": round(latest_rsi, 2) if pd.notna(latest_rsi) else np.nan,
-                    "Trailing P/E": round(pe_ratio, 2) if pd.notna(pe_ratio) else np.nan,
-                    "Fair Value Price": round(fair_value_price, 2) if pd.notna(fair_value_price) else np.nan,
-                    "Oscillator": round(latest_oscillator, 2) if pd.notna(latest_oscillator) else np.nan,
-                    "Cycle Signal": "Buy" if latest_cycle_signal == 1 else ("Sell" if latest_cycle_signal == -1 else "Hold"),
-                    "Company Name": info.get("shortName", "N/A"),
-                    "Sector": info.get("sector", "N/A"),
-                })
-        
-        except Exception as e:
-            # Log the error with ticker information
-            logging.error(f"Error processing {ticker}: {e}")
-            pass
-        
-        # Update progress
-        progress_bar.progress((idx + 1) / total)
-        status_text.text(f"Processing {idx + 1} of {total} tickers...")
-    
-    # Convert results to DataFrame
-    results_df = pd.DataFrame(results)
-    
-    # Conditional Sorting
-    if not results_df.empty and "RSI" in results_df.columns:
-        results_df.sort_values(by="RSI", inplace=True)
-    
-    return results_df
+    with Pool(processes=cpu_count()) as pool:
+        func = partial(process_ticker, start=start, end=end, period=period, initial_cash=initial_cash)
+        for i, result in enumerate(pool.imap(func, tickers), 1):
+            if result is not None:
+                results.append(result)
+            update_progress(i, total)
+    return results
 
-# Display the screening results
-if start_screening:
-    with st.spinner("Fetching S&P 500 tickers..."):
-        try:
-            sp500_tickers = fetch_sp500_tickers()
-        except Exception as e:
-            st.error(f"Error fetching S&P 500 tickers: {e}")
-            sp500_tickers = []
-    
-    if sp500_tickers:
-        with st.spinner("Screening stocks based on your criteria..."):
-            screened_df = screen_stocks(
-                tickers=sp500_tickers,
-                rsi_threshold=rsi_threshold,
-                pe_threshold=pe_threshold,
-                lookback_days=lookback_days,
-                dpo_length=dpo_length,
-                dpo_smooth_factor=dpo_smooth_factor
-            )
-    
-        if not screened_df.empty:
-            st.success("Screening complete! Found the following stocks:")
-            # Display the DataFrame
-            st.dataframe(
-                screened_df.style.format({
-                    "Current Price": "${:.2f}",
-                    "RSI": "{:.2f}",
-                    "Trailing P/E": "{:.2f}",
-                    "Fair Value Price": "${:.2f}",
-                    "Oscillator": "{:.2f}",
-                }),
-                height=600,
-            )
-            # Optionally, provide download option
-            csv = screened_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="Download Results as CSV",
-                data=csv,
-                file_name='sp500_undervalued_oversold_dpo.csv',
-                mime='text/csv',
-            )
-        else:
-            st.info("No stocks found matching the criteria.")
-    else:
-        st.error("Failed to retrieve S&P 500 tickers.")
+# Run backtest
+with st.spinner("Running DPO strategy on selected stocks..."):
+    results = run_backtest(selected_tickers, start_date, end_date, dpo_period, initial_cash)
 
-# Optional: Display app information or disclaimers
-st.markdown("---")
-st.markdown("""
-**Disclaimer**: This app is for educational purposes only and does not constitute financial advice. Always conduct your own research or consult a financial professional before making investment decisions.
-""")
+progress_bar.empty()
+status_text.empty()
+
+# Convert results to DataFrame
+results_df = pd.DataFrame(results)
+
+if results_df.empty:
+    st.warning("No data available for the selected stocks and date range.")
+else:
+    # Display aggregate performance
+    if analysis_type == "Aggregate Performance":
+        st.subheader("💼 Aggregate Performance Metrics")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Stocks Analyzed", len(results_df))
+        total_profit = results_df['Profit'].sum()
+        total_initial = results_df['Initial Cash'].sum()
+        col2.metric("Total Profit", f"${total_profit:,.2f}")
+        col3.metric("Average ROI", f"{results_df['ROI (%)'].mean():.2f}%")
+        col4.metric("Best Performer", results_df.loc[results_df['Profit'].idxmax()]['Ticker'])
+
+        # Top 10 Performers
+        st.subheader("🏆 Top 10 Stocks by ROI")
+        top10 = results_df.sort_values(by='ROI (%)', ascending=False).head(10)
+        st.dataframe(top10[['Ticker', 'Final Portfolio Value', 'Profit', 'ROI (%)']])
+
+        # Distribution of ROI
+        st.subheader("📈 ROI Distribution")
+        fig, ax = plt.subplots(figsize=(10,6))
+        sns.histplot(results_df['ROI (%)'], bins=30, kde=True, ax=ax, color='skyblue')
+        ax.set_title("Distribution of ROI (%) Across S&P 500 Stocks")
+        ax.set_xlabel("ROI (%)")
+        ax.set_ylabel("Frequency")
+        st.pyplot(fig)
+
+        # Scatter Plot: Initial Cash vs Final Portfolio Value
+        st.subheader("📊 Initial Cash vs Final Portfolio Value")
+        fig2, ax2 = plt.subplots(figsize=(10,6))
+        sns.scatterplot(data=results_df, x='Initial Cash', y='Final Portfolio Value', hue='ROI (%)', palette='viridis', ax=ax2)
+        ax2.set_title("Initial Cash vs Final Portfolio Value")
+        ax2.set_xlabel("Initial Cash ($)")
+        ax2.set_ylabel("Final Portfolio Value ($)")
+        st.pyplot(fig2)
+
+    elif analysis_type == "Individual Stock Analysis":
+        st.subheader("📄 Individual Stock Performance")
+        st.dataframe(results_df[['Ticker', 'Final Portfolio Value', 'Profit', 'ROI (%)']].sort_values(by='ROI (%)', ascending=False))
+
+        # Allow user to select a stock to visualize
+        selected_stock = st.selectbox("Select a Stock to View Detailed Analysis", options=results_df['Ticker'].tolist())
+        if selected_stock:
+            # Load data again for the selected stock
+            stock_data = load_data(selected_stock, start_date, end_date)
+            if stock_data is not None:
+                stock_data = calculate_dpo(stock_data, dpo_period)
+                stock_data = generate_signals(stock_data)
+                stock_data = backtest_strategy(stock_data, initial_cash)
+
+                # Plot Close Price with Buy/Sell Signals
+                fig3, (ax1, ax2) = plt.subplots(2, 1, figsize=(14,10), sharex=True)
+
+                ax1.plot(stock_data.index, stock_data['Close'], label='Close Price', color='blue')
+                ax1.set_title(f"{selected_stock} Close Price with Buy/Sell Signals")
+                ax1.set_ylabel("Price ($)")
+                ax1.legend()
+
+                # Plot Buy Signals
+                buy_signals = stock_data[stock_data['Signal'] == 1]
+                ax1.scatter(buy_signals.index, buy_signals['Close'], marker='^', color='green', label='Buy Signal', s=100)
+
+                # Plot Sell Signals
+                sell_signals = stock_data[stock_data['Signal'] == -1]
+                ax1.scatter(sell_signals.index, sell_signals['Close'], marker='v', color='red', label='Sell Signal', s=100)
+
+                ax1.legend()
+
+                # Plot DPO
+                ax2.plot(stock_data.index, stock_data['DPO'], label='DPO', color='purple')
+                ax2.axhline(0, color='black', linestyle='--', linewidth=1)
+                ax2.set_title("Dynamic Price Oscillator (DPO)")
+                ax2.set_ylabel("DPO Value")
+                ax2.legend()
+
+                plt.tight_layout()
+                st.pyplot(fig3)
+
+                # Plot Portfolio Value
+                st.subheader("💼 Portfolio Value Over Time")
+                fig4, ax3 = plt.subplots(figsize=(14,6))
+                ax3.plot(stock_data.index, stock_data['Portfolio Value'], label='Portfolio Value', color='orange')
+                ax3.set_title("Portfolio Value Over Time")
+                ax3.set_xlabel("Date")
+                ax3.set_ylabel("Value ($)")
+                ax3.legend()
+
+                plt.tight_layout()
+                st.pyplot(fig4)
+
+                # Performance Metrics
+                final_portfolio = stock_data['Portfolio Value'].iloc[-1]
+                profit = final_portfolio - initial_cash
+                roi = (profit / initial_cash) * 100
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Initial Cash", f"${initial_cash:,.2f}")
+                col2.metric("Final Portfolio Value", f"${final_portfolio:,.2f}")
+                col3.metric("Profit", f"${profit:,.2f}", f"{roi:.2f}% ROI")
+
+                # Show recent signals and portfolio values
+                st.subheader("🔍 Recent Trades and Portfolio Values")
+                st.write(stock_data[['Close', 'DPO', 'Signal', 'Portfolio Value']].tail(100))
+            else:
+                st.warning("No data available for the selected stock.")
+
+    # Option to download results
+    st.subheader("💾 Download Results")
+    csv = results_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="Download Results as CSV",
+        data=csv,
+        file_name='dpo_sp500_strategy_results.csv',
+        mime='text/csv',
+    )
+
+    # Footer
+    st.markdown("""
+    ---
+    **Note:** This application performs a simplified backtest of the DPO strategy across S&P 500 stocks. It does not account for transaction costs, slippage, or other real-world trading factors. Always perform thorough testing and consider additional factors before deploying any trading strategy.
+    """)
