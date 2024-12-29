@@ -1,7 +1,3 @@
-#####################################
-# script_streamlit_screener.py
-#####################################
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,7 +6,7 @@ from datetime import datetime, timedelta
 import io
 
 ############################
-# FUNZIONI DI SUPPORTO
+# Funzioni di supporto
 ############################
 
 @st.cache_data
@@ -30,8 +26,7 @@ def get_sp500_companies():
 
 def chunk_list(lst, chunk_size=50):
     """
-    Suddivide una lista in chunk di dimensione fissa, 
-    per evitare chiamate troppo grandi alle API di Yahoo.
+    Suddivide una lista in chunk di dimensione fissa, per evitare chiamate troppo grandi alle API di Yahoo.
     """
     for i in range(0, len(lst), chunk_size):
         yield lst[i:i + chunk_size]
@@ -43,6 +38,7 @@ def get_market_caps_bulk(tickers):
     Utilizza un meccanismo a chunk per evitare chiamate troppo grandi a Yahoo Finance.
     """
     caps = {}
+    # Suddividiamo i ticker in chunk
     for tk_chunk in chunk_list(tickers, chunk_size=50):
         joined_tickers = " ".join(tk_chunk)
         bulk_obj = yf.Tickers(joined_tickers)
@@ -62,10 +58,6 @@ def filter_stocks_by_market_cap(tickers, min_market_cap=10_000_000_000):
     filtered = [t for t in tickers if caps_dict.get(t, 0) >= min_market_cap]
     return filtered
 
-############################
-# FUNZIONI PER L'ANALISI TECNICA (Fibonacci Screener)
-############################
-
 def find_previous_swing_points(df, exclude_days=5):
     """
     Trova i massimi e minimi precedenti, escludendo gli ultimi 'exclude_days' dati.
@@ -82,6 +74,7 @@ def find_previous_swing_points(df, exclude_days=5):
 def compute_fibonacci_levels(max_price, min_price):
     """
     Calcola i livelli di Fibonacci principali: 0%, 23.6%, 38.2%, 50%, 61.8%, 78.6%, 100%.
+    Restituisce un dizionario con i livelli.
     """
     if max_price is None or min_price is None:
         return {}
@@ -107,9 +100,8 @@ def is_near_level(current_price, target_price, tolerance=0.01):
     return abs(current_price - target_price) / abs(target_price) <= tolerance
 
 ############################
-# INDICATORI CLASSICI
+# Indicatori classici
 ############################
-
 def compute_rsi(series, period=14):
     """
     Calcola l'RSI (Relative Strength Index) a 14 periodi di default.
@@ -135,8 +127,8 @@ def compute_stochastic(high, low, close, k_period=14, d_period=3):
 
 def compute_macd(close, fastperiod=12, slowperiod=26, signalperiod=9):
     """
-    Calcola la MACD standard (EMA12 - EMA26) e linea di segnale (EMA9).
-    Restituisce la linea MACD, la linea segnale e l'istogramma.
+    Calcola la MACD standard con periodi di default 12 (veloce), 26 (lento) e 9 (signal).
+    Restituisce la linea macd, la linea segnale e l'istogramma.
     """
     ema_fast = close.ewm(span=fastperiod, adjust=False).mean()
     ema_slow = close.ewm(span=slowperiod, adjust=False).mean()
@@ -146,9 +138,8 @@ def compute_macd(close, fastperiod=12, slowperiod=26, signalperiod=9):
     return macd_line, signal_line, hist
 
 ############################
-# DYNAMIC PRICE OSCILLATOR (Zeiierman)
+# Dynamic Price Oscillator (Zeiierman)
 ############################
-
 def compute_dynamic_price_oscillator(df, length=33, smooth_factor=5):
     """
     Calcola il Dynamic Price Oscillator (Zeiierman) + Bollinger Bands:
@@ -166,7 +157,10 @@ def compute_dynamic_price_oscillator(df, length=33, smooth_factor=5):
     true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     vol_adj_price = true_range.ewm(span=length, adjust=False).mean()
 
+    # price_change
     price_change = close - close.shift(length)
+
+    # price_delta
     price_delta = close - vol_adj_price
 
     # oscillator = EMA( avg(priceDelta, priceChange), smooth_factor )
@@ -180,15 +174,15 @@ def compute_dynamic_price_oscillator(df, length=33, smooth_factor=5):
 
     bbHigh = basis_1dev + 1 * std_1dev
     bbLow  = basis_1dev - 1 * std_1dev
+
     bbHighExp = basis_1dev + 2 * std_1dev
     bbLowExp  = basis_1dev - 2 * std_1dev
 
     return oscillator, bbHigh, bbLow, bbHighExp, bbLowExp
 
 ############################
-# LOGICA OVERBOUGHT/OVERSOLD
+# Logica di oversold/overbought
 ############################
-
 def passes_osc_conditions(
     rsi_val, stoch_k_val, macd_val, signal_val,
     check_rsi=True, check_stoch=True, check_macd=True,
@@ -196,59 +190,67 @@ def passes_osc_conditions(
 ):
     """
     Restituisce True se il titolo passa TUTTI i filtri RSI, Stoch, MACD attivati.
-    Esempio oversold: RSI < 30, Stoch K < 20, MACD < 0 e < Signal.
+    Possibilità di personalizzare le soglie RSI e Stocastico.
     """
-    # RSI
+    # 1) RSI oversold: rsi < rsi_threshold (default 30)
     if check_rsi and rsi_val >= rsi_threshold:
         return False
-    # Stocastico
+
+    # 2) Stoch oversold: stoch_k < stoch_threshold (default 20)
     if check_stoch and stoch_k_val >= stoch_threshold:
         return False
-    # MACD
+
+    # 3) MACD oversold: macd < 0 e macd < signal
     if check_macd and (macd_val >= 0 or macd_val >= signal_val):
         return False
+
     return True
 
-def passes_dpo_condition(dpo_val, dpo_bb_low, dpo_bb_high, dpo_mode="Nessuna"):
+def passes_dpo_condition(
+    dpo_val, dpo_bb_low, dpo_bb_high,
+    dpo_mode="Nessuna"
+):
     """
     dpo_mode: "Nessuna", "Oversold (DPO < BB Low)", "Overbought (DPO > BB High)"
+    Se l'utente non vuole filtrare per DPO, restituisce True.
     """
     if dpo_mode == "Nessuna":
         return True
+    # Evitiamo errori
     if (
-        dpo_val is None or pd.isna(dpo_val) or
-        dpo_bb_low is None or pd.isna(dpo_bb_low) or
-        dpo_bb_high is None or pd.isna(dpo_bb_high)
+        dpo_val is None or pd.isna(dpo_val)
+        or dpo_bb_low is None or pd.isna(dpo_bb_low)
+        or dpo_bb_high is None or pd.isna(dpo_bb_high)
     ):
         return False
 
-    # Oversold
+    # Logica di oversold
     if dpo_mode.startswith("Oversold") and dpo_val >= dpo_bb_low:
         return False
-    # Overbought
+
+    # Logica di overbought
     if dpo_mode.startswith("Overbought") and dpo_val <= dpo_bb_high:
         return False
 
     return True
 
 ############################
-# FUNZIONE DI ENTRY & STOP (FIBONACCI)
+# Funzione di entry & stop
 ############################
-
 def define_trade_levels(current_price, min_price, stop_pct=0.01):
     """
     Definisce entry e stop loss:
     - Entry Price = current_price
     - Stop Price = (1 - stop_pct) * min_price
+    Di default stop a -1% rispetto al minimo più recente.
     """
     entry_price = current_price
     stop_price = min_price * (1 - stop_pct)
     return round(entry_price, 2), round(stop_price, 2)
 
 ############################
-# FIBONACCI SCREENER
+# Screener Fibonacci
 ############################
-
 def fibonacci_screener_entry_stop(
     tickers, 
     exclude_days=5, 
@@ -258,17 +260,18 @@ def fibonacci_screener_entry_stop(
     dpo_mode="Nessuna",
     dpo_length=33,
     dpo_smooth=5,
-    fib_tolerance=0.01,
-    rsi_threshold=30,
-    stoch_threshold=20,
-    stop_pct=0.01
+    fib_tolerance=0.01,      # Parametro per regolare la tolleranza di vicinanza al 61.8% di Fibonacci
+    rsi_threshold=30,        # Parametro per personalizzare la soglia RSI
+    stoch_threshold=20,      # Parametro per personalizzare la soglia Stocastico
+    stop_pct=0.01            # Parametro per personalizzare la distanza dello stop dal minimo
 ):
     """
-    Screener basato su rimbalzo al 61.8% di Fibonacci + indicatori oversold + DPO.
+    Screener originale basato su Fibonacci 61.8% + RSI/Stoch/MACD + DPO.
     """
     end = datetime.now()
     start = end - timedelta(days=90)
 
+    # Scarichiamo i dati in blocco per tutti i ticker (1h)
     data = yf.download(
         tickers,
         start=start,
@@ -285,9 +288,9 @@ def fibonacci_screener_entry_stop(
     total = len(tickers)
 
     for i, ticker in enumerate(tickers):
-        my_bar.progress((i + 1) / total)
-
         try:
+            my_bar.progress((i + 1) / total)
+
             if single_ticker:
                 df_ticker = data
             else:
@@ -332,6 +335,7 @@ def fibonacci_screener_entry_stop(
             dpo_val      = None
             dpo_bb_low   = None
             dpo_bb_high  = None
+
             if dpo_mode != "Nessuna":
                 oscillator, bbHigh, bbLow, bbHighExp, bbLowExp = compute_dynamic_price_oscillator(
                     df_ticker, length=dpo_length, smooth_factor=dpo_smooth
@@ -395,21 +399,18 @@ def fibonacci_screener_entry_stop(
     return pd.DataFrame(results)
 
 ############################
-# BREAKOUT MENSILE (CON CHECK NEGLI ULTIMI N GIORNI)
+# NUOVA FUNZIONE: Screener Breakout Mensile
 ############################
-
-def monthly_breakout_screener_recent(
+def monthly_breakout_screener(
     tickers,
     n_months=3,         # Calcolo breakout sugli ultimi N mesi
-    last_n_days=3,      # Controlliamo se il breakout è avvenuto negli ultimi N giorni
     start_date="2020-01-01",
     end_date=None
 ):
     """
     Scarica i dati giornalieri per ogni ticker, ricampiona mensilmente,
-    calcola rolling max/min sugli ultimi n_months (shift(1)).
-    Poi controlla negli ultimi 'last_n_days' se c'è stata una chiusura > rolling_max (breakout long)
-    o < rolling_min (breakout short).
+    verifica se la chiusura mensile supera il max (breakout long) o scende sotto il min (breakout short)
+    degli ultimi n_months.
     """
     if end_date is None:
         end_date = datetime.now().strftime("%Y-%m-%d")
@@ -418,6 +419,7 @@ def monthly_breakout_screener_recent(
     my_bar = st.progress(0)
     total = len(tickers)
 
+    # Scarichiamo i dati per ogni ticker separatamente per gestire eventuali errori
     for i, ticker in enumerate(tickers):
         my_bar.progress((i + 1) / total)
         try:
@@ -431,45 +433,40 @@ def monthly_breakout_screener_recent(
                 'High': 'max',
                 'Low': 'min',
                 'Close': 'last'
-            }).dropna()
+            })
+            df_monthly.dropna(inplace=True)
 
-            # rolling_max e rolling_min
+            # Rolling max e min degli ultimi n_months (con shift(1) per evitare lookahead)
             df_monthly['rolling_max'] = df_monthly['High'].rolling(n_months).max().shift(1)
             df_monthly['rolling_min'] = df_monthly['Low'].rolling(n_months).min().shift(1)
 
-            if len(df_monthly) < 1:
+            # Segnale breakout
+            df_monthly['signal'] = 0
+            df_monthly.loc[df_monthly['Close'] > df_monthly['rolling_max'], 'signal'] = 1
+            df_monthly.loc[df_monthly['Close'] < df_monthly['rolling_min'], 'signal'] = -1
+
+            # Ritorniamo solo l'ultimo segnale (l'ultima riga)
+            latest = df_monthly.iloc[-1]
+            signal_value = latest['signal']
+
+            if pd.isna(signal_value):
                 continue
 
-            latest_month = df_monthly.iloc[-1]
-            rmax = latest_month['rolling_max']
-            rmin = latest_month['rolling_min']
-            if pd.isna(rmax) or pd.isna(rmin):
-                continue
+            if signal_value == 1:
+                direction = "Breakout Long"
+            elif signal_value == -1:
+                direction = "Breakout Short"
+            else:
+                direction = "No breakout"
 
-            # Controlliamo negli ultimi 'last_n_days'
-            if len(df_daily) < last_n_days:
-                continue
-
-            df_recent = df_daily.tail(last_n_days)
-            max_recent_close = df_recent['Close'].max()
-            min_recent_close = df_recent['Close'].min()
-
-            signal = "No breakout"
-            if max_recent_close > rmax:
-                signal = "Breakout Long"
-            elif min_recent_close < rmin:
-                signal = "Breakout Short"
-
+            # Aggiungiamo i risultati in tabella
             results.append({
                 "Ticker": ticker,
-                "Ultima Chiusura": round(df_daily['Close'].iloc[-1], 2),
-                f"rolling_max_{n_months}m": round(rmax, 2),
-                f"rolling_min_{n_months}m": round(rmin, 2),
-                "Max Close (ultimi N gg)": round(max_recent_close, 2),
-                "Min Close (ultimi N gg)": round(min_recent_close, 2),
-                "Breakout in ultimi N giorni": signal
+                "Ultima Chiusura (mensile)": round(latest['Close'], 2),
+                f"Max Ultimi {n_months} mesi": round(latest['rolling_max'], 2) if not pd.isna(latest['rolling_max']) else None,
+                f"Min Ultimi {n_months} mesi": round(latest['rolling_min'], 2) if not pd.isna(latest['rolling_min']) else None,
+                "Segnale": direction
             })
-
         except Exception as e:
             st.warning(f"Errore su {ticker}: {e}")
             continue
@@ -478,103 +475,25 @@ def monthly_breakout_screener_recent(
     return pd.DataFrame(results)
 
 ############################
-# STOCK PICKING (FILTRI FONDAMENTALI)
+# App Streamlit (MODIFICATA)
 ############################
-
-@st.cache_data
-def get_fundamentals_bulk(tickers):
-    """
-    Scarica alcuni dati fondamentali per ogni ticker (es. trailingPE, forwardPE, priceToBook, pegRatio, dividendYield).
-    Ritorna un DataFrame con colonne: [symbol, trailingPE, forwardPE, priceToBook, pegRatio, dividendYield].
-    """
-    fundamentals_list = []
-    for tk_chunk in chunk_list(tickers, chunk_size=50):
-        joined_tickers = " ".join(tk_chunk)
-        bulk_obj = yf.Tickers(joined_tickers)
-        for t in tk_chunk:
-            try:
-                info = bulk_obj.tickers[t].info
-                trailing_pe = info.get("trailingPE", None)
-                forward_pe = info.get("forwardPE", None)
-                pb = info.get("priceToBook", None)
-                peg = info.get("pegRatio", None)
-                dividend_yield = info.get("dividendYield", None)
-
-                fundamentals_list.append({
-                    "symbol": t,
-                    "trailingPE": trailing_pe,
-                    "forwardPE": forward_pe,
-                    "priceToBook": pb,
-                    "pegRatio": peg,
-                    "dividendYield": dividend_yield
-                })
-            except Exception:
-                fundamentals_list.append({
-                    "symbol": t,
-                    "trailingPE": None,
-                    "forwardPE": None,
-                    "priceToBook": None,
-                    "pegRatio": None,
-                    "dividendYield": None
-                })
-    df_fund = pd.DataFrame(fundamentals_list)
-    return df_fund
-
-def stock_picking_screener(
-    tickers, 
-    max_pe=20, 
-    max_pb=3, 
-    min_dividend=0.02
-):
-    """
-    Esempio di stock picking screener:
-      - trailingPE < max_pe
-      - priceToBook < max_pb
-      - dividendYield >= min_dividend
-    """
-    df_fund = get_fundamentals_bulk(tickers)
-
-    df_fund['trailingPE'] = df_fund['trailingPE'].fillna(999999)
-    df_fund['priceToBook'] = df_fund['priceToBook'].fillna(999999)
-    df_fund['dividendYield'] = df_fund['dividendYield'].fillna(0)
-
-    filtered_df = df_fund[
-        (df_fund['trailingPE'] > 0) & (df_fund['trailingPE'] < max_pe) &
-        (df_fund['priceToBook'] > 0) & (df_fund['priceToBook'] < max_pb) &
-        (df_fund['dividendYield'] >= min_dividend)
-    ].copy()
-
-    # Ordina per trailingPE (o come preferisci)
-    filtered_df.sort_values(by=['trailingPE'], inplace=True)
-    return filtered_df
-
-############################
-# APP STREAMLIT
-############################
-
 def main():
-    st.title("Screener Multiplo: Fibonacci / Breakout Mensile / Stock Picking")
+    st.title("Screener Multiplo: Fibonacci / Breakout Mensile")
     
-    # Scelta strategia
+    # Scelta della strategia
     st.subheader("Seleziona la strategia da eseguire:")
     strategy_choice = st.selectbox(
         "Strategia",
-        [
-            "Fibonacci RSI/Stoch/MACD + DPO",
-            "Breakout Mensile (ultimi N giorni)",
-            "Stock Picking (fondamentale)"
-        ]
+        ["Fibonacci RSI/Stoch/MACD + DPO", "Breakout Mensile (N mesi)"]
     )
 
-    st.subheader("1) Parametri di filtraggio (Market Cap)")
+    st.subheader("1) Parametri di filtraggio")
     min_market_cap = st.number_input("Min Market Cap (in $)", value=10_000_000_000, step=1_000_000_000)
-
-    # Parametri personalizzati in base alla strategia scelta
+    
     if strategy_choice == "Fibonacci RSI/Stoch/MACD + DPO":
-        st.subheader("2) Parametri Fibonacci")
         exclude_days = st.number_input("Escludi ultimi N giorni (swing precedenti)", value=5, step=1)
         
-        st.subheader("Indicatori di 'Oversold'")
+        st.subheader("2) Parametri di 'Oversold'")
         rsi_flag = st.checkbox("RSI < soglia (default 30)?", value=True)
         rsi_thr = st.number_input("Soglia RSI", value=30, step=1)
 
@@ -596,19 +515,12 @@ def main():
         fib_tolerance = st.number_input("Tolleranza Fib 61.8% (es: 0.01 = 1%)", value=0.01, step=0.001)
         stop_pct_val = st.number_input("Stop Loss % sotto il minimo swing", value=0.01, step=0.001)
 
-    elif strategy_choice == "Breakout Mensile (ultimi N giorni)":
+    else:
+        # Parametri specifici della strategia di Breakout Mensile
         st.subheader("2) Parametri Breakout Mensile")
-        n_months = st.number_input("N mesi di lookback (es: 3)", value=3, step=1)
-        last_n_days = st.number_input("Controlla breakout negli ultimi N giorni", value=3, step=1)
+        n_months = st.number_input("N mesi di lookback per il breakout (es: 3)", value=3, step=1)
         start_str = st.text_input("Data inizio (YYYY-MM-DD)", "2020-01-01")
 
-    else:  # Stock Picking
-        st.subheader("2) Parametri Stock Picking")
-        max_pe_val = st.number_input("Max Trailing P/E", value=20, step=1)
-        max_pb_val = st.number_input("Max Price/Book", value=3, step=1)
-        min_div_val = st.number_input("Min Dividend Yield (es. 0.02 = 2%)", value=0.02, step=0.01)
-
-    # Avvio Screener
     if st.button("Esegui Screener"):
         sp500_df = get_sp500_companies()
         if sp500_df.empty:
@@ -626,8 +538,8 @@ def main():
             st.warning("Nessun ticker supera la capitalizzazione richiesta.")
             return
 
-        # Selezioniamo la logica in base alla strategia
         if strategy_choice == "Fibonacci RSI/Stoch/MACD + DPO":
+            # Esegui lo screener Fibonacci
             df_results = fibonacci_screener_entry_stop(
                 tickers=filtered,
                 exclude_days=exclude_days,
@@ -642,83 +554,60 @@ def main():
                 stoch_threshold=stoch_thr,
                 stop_pct=stop_pct_val
             )
+
             if df_results.empty:
                 st.info("Nessun titolo rispetta i criteri selezionati.")
             else:
-                st.success(f"Trovati {len(df_results)} titoli (strategia Fibonacci):")
+                st.success(f"Trovati {len(df_results)} titoli con strategia Fibonacci:")
                 st.dataframe(df_results)
 
-                # Download
+                # Export watchlist in formato testo
                 watchlist = df_results['Ticker'].tolist()
                 csv_buffer = io.StringIO()
                 for t in watchlist:
                     csv_buffer.write(t + "\n")
                 csv_data = csv_buffer.getvalue()
+
                 st.download_button(
                     label="Scarica Tickers",
                     data=csv_data,
-                    file_name="fibonacci_watchlist.txt",
+                    file_name="my_watchlist_fib.txt",
                     mime="text/plain"
                 )
 
-        elif strategy_choice == "Breakout Mensile (ultimi N giorni)":
-            df_breakout = monthly_breakout_screener_recent(
+        else:
+            # Esegui lo screener Breakout Mensile
+            df_breakout = monthly_breakout_screener(
                 tickers=filtered,
                 n_months=n_months,
-                last_n_days=last_n_days,
                 start_date=start_str
             )
+
             if df_breakout.empty:
-                st.info("Nessun segnale di breakout negli ultimi giorni.")
+                st.info("Nessun segnale di breakout mensile individuato.")
             else:
-                st.success(f"Trovati {len(df_breakout)} tickers con breakout (ultimi {last_n_days} giorni):")
+                st.success(f"Trovati {len(df_breakout)} tickers con segnale breakout mensile (ultimi {n_months} mesi):")
                 st.dataframe(df_breakout)
 
-                # Download
+                # Export watchlist in formato testo
                 watchlist = df_breakout['Ticker'].tolist()
                 csv_buffer = io.StringIO()
                 for t in watchlist:
                     csv_buffer.write(t + "\n")
                 csv_data = csv_buffer.getvalue()
+
                 st.download_button(
                     label="Scarica Tickers",
                     data=csv_data,
-                    file_name="breakout_watchlist.txt",
+                    file_name="my_watchlist_breakout.txt",
                     mime="text/plain"
                 )
 
-        else:  # Stock Picking (fondamentale)
-            df_picked = stock_picking_screener(
-                filtered, 
-                max_pe=max_pe_val,
-                max_pb=max_pb_val,
-                min_dividend=min_div_val
-            )
-            if df_picked.empty:
-                st.info("Nessun titolo rispetta i criteri fondamentali.")
-            else:
-                st.success(f"Trovati {len(df_picked)} titoli con parametri fondamentali richiesti:")
-                st.dataframe(df_picked)
-
-                # Download
-                watchlist = df_picked['symbol'].tolist()
-                csv_buffer = io.StringIO()
-                for t in watchlist:
-                    csv_buffer.write(t + "\n")
-                csv_data = csv_buffer.getvalue()
-                st.download_button(
-                    label="Scarica Tickers",
-                    data=csv_data,
-                    file_name="fundamentals_watchlist.txt",
-                    mime="text/plain"
-                )
-
-    # Disclaimer
+    # Piccola nota/disclaimer a fondo pagina
     st.write("---")
     st.markdown("""
     **Disclaimer**: Questo screener è a puro scopo didattico. 
-    Non costituisce consiglio finanziario. Si raccomanda di fare le proprie analisi 
-    prima di effettuare operazioni di trading.
+    Non costituisce consiglio finanziario. Si raccomanda di fare le proprie analisi prima di effettuare operazioni di trading.
     """)
 
 if __name__ == "__main__":
