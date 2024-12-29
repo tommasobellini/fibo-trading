@@ -6,6 +6,7 @@ import requests
 from datetime import datetime, timedelta
 from typing import List
 import logging
+from scipy.signal import hilbert
 
 # Configure logging
 logging.basicConfig(
@@ -16,13 +17,13 @@ logging.basicConfig(
 
 # Set Streamlit page configuration
 st.set_page_config(
-    page_title="S&P 500 Stock Screener with Dynamic Price Oscillator",
+    page_title="S&P 500 Stock Screener with Cycle Analysis",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # Title of the app
-st.title("📈 S&P 500 Stock Screener: Undervalued & Oversold Stocks with DPO")
+st.title("📈 S&P 500 Stock Screener: Undervalued & Oversold Stocks with Cycle Analysis")
 
 # Sidebar for user inputs
 st.sidebar.header("Screening Parameters")
@@ -163,6 +164,33 @@ def calculate_RSI(series: pd.Series, period: int = 14) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
+# Function to calculate Cycle Oscillator using Hilbert Transform
+def calculate_cycle_oscillator(df, close_column='Close'):
+    """
+    Calculate the Cycle Oscillator using Hilbert Transform.
+    
+    Parameters:
+    - df: DataFrame with price data.
+    - close_column: Column name for closing prices.
+    
+    Returns:
+    - df: DataFrame with added 'Cycle' and 'Cycle_Period' columns.
+    """
+    # Compute the analytic signal
+    analytic_signal = hilbert(df[close_column].fillna(method='ffill'))
+    # Compute the instantaneous phase
+    instantaneous_phase = np.unwrap(np.angle(analytic_signal))
+    # Compute the instantaneous frequency
+    instantaneous_frequency = np.diff(instantaneous_phase) / (2.0*np.pi) * 252  # Annualize frequency
+    # Pad the frequency array to match the length
+    instantaneous_frequency = np.concatenate(([instantaneous_frequency[0]], instantaneous_frequency))
+    # Compute the cycle period
+    cycle_period = 1 / instantaneous_frequency
+    # Add cycle and cycle period to DataFrame
+    df['Cycle'] = cycle_period
+    df['Cycle_Period'] = cycle_period
+    return df
+
 # Function to check if oscillator is below Bollinger Bands
 def is_oscillator_below_bbands(df):
     """
@@ -180,6 +208,23 @@ def is_undervalued(pe_ratio: float, max_pe: float) -> bool:
     if pd.isna(pe_ratio) or pe_ratio <= 0:
         return False
     return pe_ratio < max_pe
+
+# Function to generate buy and sell signals based on cycles
+def generate_cycle_signals(df):
+    """
+    Generate buy and sell signals based on the Cycle Oscillator.
+    
+    Parameters:
+    - df: DataFrame with 'Oscillator' and 'Cycle' columns.
+    
+    Returns:
+    - df: DataFrame with added 'Cycle_Signal' column.
+    """
+    df['Cycle_Signal'] = 0
+    # Buy Signal: Oscillator crosses above BB_Low or BB_LowExp
+    df['Cycle_Signal'][(df['Oscillator'] < df['BB_Low']) & (df['Oscillator'].shift(1) >= df['BB_Low'].shift(1))] = 1
+    df['Cycle_Signal'][(df['Oscillator'] > df['BB_High']) & (df['Oscillator'].shift(1) <= df['BB_High'].shift(1))] = -1
+    return df
 
 # Main screening function
 def screen_stocks(
@@ -216,14 +261,19 @@ def screen_stocks(
             # Calculate Dynamic Price Oscillator
             df = calculate_dynamic_price_oscillator(df, length=dpo_length, smooth_factor=dpo_smooth_factor)
             
-            # Get the latest RSI and Oscillator values
+            # Calculate Cycle Oscillator
+            df = calculate_cycle_oscillator(df, close_column='Close')
+            
+            # Generate Cycle Signals
+            df = generate_cycle_signals(df)
+            
+            # Get the latest RSI, Oscillator, and Cycle Signal values
             latest_rsi = df['RSI'].iloc[-1] if not df['RSI'].isna().all() else np.nan
             latest_oscillator = df['Oscillator'].iloc[-1] if not df['Oscillator'].isna().all() else np.nan
+            latest_cycle_signal = df['Cycle_Signal'].iloc[-1] if not df['Cycle_Signal'].isna().all() else 0
             
-            # Check oscillator condition
-            oscillator_condition = False
-            if not df[['Oscillator', 'BB_Low', 'BB_LowExp']].isna().all().all():
-                oscillator_condition = is_oscillator_below_bbands(df).iloc[-1]
+            # Check cycle condition (buy signal)
+            cycle_condition = latest_cycle_signal == 1  # Modify as per strategy
             
             # Fetch fundamental data
             ticker_obj = yf.Ticker(ticker)
@@ -247,7 +297,7 @@ def screen_stocks(
             # Check combined criteria
             if (is_oversold(latest_rsi, rsi_threshold) and
                 is_undervalued(pe_ratio, pe_threshold) and
-                oscillator_condition):
+                cycle_condition):
                 
                 results.append({
                     "Ticker": ticker,
@@ -256,6 +306,7 @@ def screen_stocks(
                     "Trailing P/E": round(pe_ratio, 2) if pd.notna(pe_ratio) else np.nan,
                     "Fair Value Price": round(fair_value_price, 2) if pd.notna(fair_value_price) else np.nan,
                     "Oscillator": round(latest_oscillator, 2) if pd.notna(latest_oscillator) else np.nan,
+                    "Cycle Signal": "Buy" if latest_cycle_signal == 1 else ("Sell" if latest_cycle_signal == -1 else "Hold"),
                     "Company Name": info.get("shortName", "N/A"),
                     "Sector": info.get("sector", "N/A"),
                 })
