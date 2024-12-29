@@ -8,8 +8,11 @@ from typing import List
 import logging
 
 # Configure logging
-logging.basicConfig(filename='app.log', level=logging.ERROR, 
-                    format='%(asctime)s %(levelname)s:%(message)s')
+logging.basicConfig(
+    filename='app.log',
+    level=logging.ERROR,
+    format='%(asctime)s %(levelname)s:%(message)s'
+)
 
 # Set Streamlit page configuration
 st.set_page_config(
@@ -269,8 +272,9 @@ def screen_stocks(
     # Convert results to DataFrame
     results_df = pd.DataFrame(results)
     
-    # Sort by RSI ascending
-    results_df.sort_values(by="RSI", inplace=True)
+    # Conditional Sorting
+    if not results_df.empty and "RSI" in results_df.columns:
+        results_df.sort_values(by="RSI", inplace=True)
     
     return results_df
 
@@ -293,7 +297,7 @@ if start_screening:
                 dpo_length=dpo_length,
                 dpo_smooth_factor=dpo_smooth_factor
             )
-        
+    
         if not screened_df.empty:
             st.success("Screening complete! Found the following stocks:")
             # Display the DataFrame
