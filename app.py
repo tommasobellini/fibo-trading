@@ -2,394 +2,200 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.cluster import KMeans
 from datetime import datetime, timedelta
-import plotly.graph_objects as go
-from concurrent.futures import ThreadPoolExecutor
 import requests
 from bs4 import BeautifulSoup
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
-
-def get_sp500_tickers():
-    """Scrape S&P 500 tickers from Wikipedia."""
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    response = requests.get(url)
-    if response.status_code != 200:
-        raise Exception("Failed to load S&P 500 page")
+def calculate_supertrend(df, period=10, multiplier=3):
+    """
+    Calculate SuperTrend indicator for the given DataFrame.
     
-    soup = BeautifulSoup(response.text, 'lxml')
+    Parameters:
+    - df: Pandas DataFrame with columns ['High', 'Low', 'Close']
+    - period: ATR period
+    - multiplier: ATR multiplier
+    
+    Returns:
+    - df: DataFrame with SuperTrend columns added
+    """
+    df = df.copy()
+    df['ATR'] = df['High'].rolling(window=period).max() - df['Low'].rolling(window=period).min()
+    df['ATR'] = df['ATR'].rolling(window=period).mean()
+
+    df['Upper Basic'] = (df['High'] + df['Low']) / 2 + multiplier * df['ATR']
+    df['Lower Basic'] = (df['High'] + df['Low']) / 2 - multiplier * df['ATR']
+
+    df['Upper Band'] = df[['Upper Basic', 'Close']].apply(
+        lambda x: min(x['Upper Basic'], x['Close']) if x['Close'] < x['Upper Basic'] else x['Upper Basic'], axis=1)
+    df['Lower Band'] = df[['Lower Basic', 'Close']].apply(
+        lambda x: max(x['Lower Basic'], x['Close']) if x['Close'] > x['Lower Basic'] else x['Lower Basic'], axis=1)
+
+    df['SuperTrend'] = np.nan
+    trend = True  # True for uptrend, False for downtrend
+
+    for current in range(1, len(df)):
+        previous = current - 1
+
+        if pd.isna(df['SuperTrend'][previous]):
+            df.at[current, 'SuperTrend'] = df.at[current, 'Lower Band']
+            continue
+
+        if df.at[current, 'Close'] > df.at[previous, 'SuperTrend']:
+            trend = True
+        elif df.at[current, 'Close'] < df.at[previous, 'SuperTrend']:
+            trend = False
+
+        if trend:
+            df.at[current, 'SuperTrend'] = df.at[current, 'Lower Band']
+        else:
+            df.at[current, 'SuperTrend'] = df.at[current, 'Upper Band']
+
+    return df
+
+@st.cache(allow_output_mutation=True)
+def get_sp500_tickers():
+    """
+    Fetch the list of S&P 500 tickers from Wikipedia.
+    
+    Returns:
+    - List of ticker symbols.
+    """
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+    response = requests.get(url)
+    soup = BeautifulSoup(response.text, 'html.parser')
     table = soup.find('table', {'id': 'constituents'})
     df = pd.read_html(str(table))[0]
     tickers = df['Symbol'].tolist()
-    # Handle tickers with dots (e.g., BRK.B) by replacing with hyphens for yfinance
+    # Adjust tickers with dots to dashes (e.g., BRK.B to BRK-B)
     tickers = [ticker.replace('.', '-') for ticker in tickers]
     return tickers
 
-@st.cache_data(ttl=3600)
-def fetch_data(ticker, start, end):
-    """Fetch historical data for a given ticker with weekly interval."""
-    try:
-        data = yf.download(ticker, start=start, end=end, interval='1wk', progress=False)
-        if data.empty:
-            return None
-        data.reset_index(inplace=True)
-        return data
-    except Exception as e:
-        return None
-
-def calculate_atr(df, length):
-    """Calculate Average True Range (ATR)."""
-    df['H-L'] = df['High'] - df['Low']
-    df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
-    df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
-    df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
-    df['ATR'] = df['TR'].rolling(window=length, min_periods=1).mean()
-    df.drop(['H-L', 'H-PC', 'L-PC', 'TR'], axis=1, inplace=True)
-    return df
-
-def calculate_supertrend(df, length, factor):
-    """Calculate SuperTrend indicator."""
-    atr = df['ATR']
-    hl2 = (df['High'] + df['Low']) / 2
-    df['Upper'] = hl2 + (atr * factor)
-    df['Lower'] = hl2 - (atr * factor)
-    df['SuperTrend'] = 0
-    df['Trend'] = 0
-
-    for i in range(1, len(df)):
-        if df['Close'][i] > df['Upper'][i-1]:
-            df.at[i, 'Trend'] = 1
-        elif df['Close'][i] < df['Lower'][i-1]:
-            df.at[i, 'Trend'] = 0
-        else:
-            df.at[i, 'Trend'] = df['Trend'][i-1]
-            if df['Trend'][i] == 1:
-                df.at[i, 'Upper'] = min(df['Upper'][i], df['Upper'][i-1])
-            else:
-                df.at[i, 'Lower'] = max(df['Lower'][i], df['Lower'][i-1])
-        
-        if df['Trend'][i] == 1:
-            df.at[i, 'SuperTrend'] = df['Lower'][i]
-        else:
-            df.at[i, 'SuperTrend'] = df['Upper'][i]
+def calculate_fibonacci_levels(df, lookback=100):
+    """
+    Calculate Fibonacci retracement levels.
     
-    return df
+    Parameters:
+    - df: DataFrame with 'High' and 'Low' columns
+    - lookback: Number of periods to look back
+    
+    Returns:
+    - Dictionary of Fibonacci levels
+    """
+    recent_data = df.tail(lookback)
+    max_price = recent_data['High'].max()
+    min_price = recent_data['Low'].min()
+    diff = max_price - min_price
+    levels = {
+        '23.6%': max_price - 0.236 * diff,
+        '38.2%': max_price - 0.382 * diff,
+        '50%': max_price - 0.5 * diff,
+        '61.8%': max_price - 0.618 * diff,
+        '78.6%': max_price - 0.786 * diff
+    }
+    return levels
 
-def perform_kmeans(data, n_clusters=3, max_iter=1000):
-    """Perform K-means clustering."""
-    if len(data) < n_clusters:
-        n_clusters = len(data)
-    kmeans = KMeans(n_clusters=n_clusters, max_iter=max_iter, random_state=42)
-    kmeans.fit(data.reshape(-1, 1))
-    return kmeans.labels_, kmeans.cluster_centers_
-
-def calculate_bull_market_support_band(df, sma_length=20, ema_length=21):
-    """Calculate Bull Market Support Band using weekly SMA and EMA."""
-    df['Weekly_SMA'] = df['Close'].rolling(window=sma_length, min_periods=1).mean()
-    df['Weekly_EMA'] = df['Close'].ewm(span=ema_length, adjust=False).mean()
-    return df
-
-def calculate_perf(df, perf_alpha):
-    """Calculate performance index similar to Pine Script."""
-    df['Close_diff'] = df['Close'].diff().fillna(0)
-    df['Diff_sign'] = np.sign(df['Close_diff'])
-    # Initialize perf
-    df['Perf'] = 0.0
-    alpha = 2 / (perf_alpha + 1)
-    for i in range(1, len(df)):
-        df.at[i, 'Perf'] = df.at[i-1, 'Perf'] + alpha * (df.at[i, 'Close_diff'] * df.at[i, 'Diff_sign'] - df.at[i-1, 'Perf'])
-    return df['Perf']
-
-def generate_signals(df, supertrend_col='SuperTrend', trend_col='Trend'):
-    """Generate buy and sell signals based on SuperTrend."""
-    df['Signal'] = 0
-    df['Signal'] = df[trend_col].diff()
-    df['Signal'] = df['Signal'].apply(lambda x: 1 if x == 1 else (-1 if x == -1 else 0))
-    return df
-
-def apply_trading_strategy(df, atr_length, min_mult, max_mult, step, perf_alpha, from_cluster, max_iter, max_data):
-    """Apply the SuperTrend AI (Clustering) and Bull Market Support Band strategy."""
-    # Limit data to the most recent 'max_data' bars
-    if max_data and len(df) > max_data:
-        df = df.tail(max_data).reset_index(drop=True)
+def apply_strategy(df):
+    """
+    Apply Fibonacci + SuperTrend strategy to the DataFrame.
     
-    # Calculate ATR
-    df = calculate_atr(df, atr_length)
+    Parameters:
+    - df: DataFrame with necessary columns
     
-    # Define factors
-    factors = np.arange(min_mult, max_mult + step, step)
-    factors = np.round(factors, 2)
+    Returns:
+    - signal: 'Buy', 'Sell', or 'Hold'
+    """
+    # Determine the latest SuperTrend
+    supertrend = df['SuperTrend'].iloc[-1]
+    close_price = df['Close'].iloc[-1]
     
-    supertrend_dict = {}
-    
-    # Calculate SuperTrend for multiple factors
-    for factor in factors:
-        temp_df = calculate_supertrend(df.copy(), atr_length, factor)
-        temp_df['Perf'] = calculate_perf(temp_df, perf_alpha)
-        supertrend_dict[factor] = temp_df['Perf']
-    
-    # Prepare data for clustering
-    perf_values = []
-    factor_values = []
-    for factor in factors:
-        perf = supertrend_dict[factor].iloc[-1]
-        perf_values.append(perf)
-        factor_values.append(factor)
-    
-    perf_array = np.array(perf_values).reshape(-1, 1)
-    
-    # Check if perf_array has sufficient variation
-    if np.std(perf_array) == 0:
-        # All perf values are the same, skip clustering
-        target_factor = min_mult
+    # Determine trend
+    if close_price > supertrend:
+        trend = 'Uptrend'
     else:
-        # Perform K-means clustering
-        labels, centers = perform_kmeans(perf_array.flatten(), n_clusters=3, max_iter=max_iter)
-        
-        cluster_info = {}
-        for i in range(len(centers)):
-            cluster_info[i] = {
-                'perf': perf_array[labels == i],
-                'factor': np.array(factor_values)[labels == i]
-            }
-        
-        # Select target cluster
-        if from_cluster == "Best":
-            target_cluster = np.argmax(centers)
-        elif from_cluster == "Average":
-            if len(centers) >=2:
-                target_cluster = 1  # Middle cluster
-            else:
-                target_cluster = 0
-        else:
-            target_cluster = np.argmin(centers)
-        
-        target_factors = cluster_info[target_cluster]['factor']
-        target_factor = target_factors.mean() if len(target_factors) > 0 else min_mult
+        trend = 'Downtrend'
     
-    # Calculate SuperTrend with target factor
-    df = calculate_supertrend(df, atr_length, target_factor)
+    # Get Fibonacci levels
+    levels = calculate_fibonacci_levels(df)
     
-    # Recalculate Perf with target SuperTrend
-    df['Perf'] = calculate_perf(df, perf_alpha)
+    # Determine proximity to Fibonacci levels (±1%)
+    tolerance = 0.01
+    signal = 'Hold'
     
-    # Calculate Performance Index (perf_idx)
-    den = df['Close'].diff().abs().ewm(span=perf_alpha, adjust=False).mean()
-    perf_idx = df['Perf'].iloc[-1] / den.iloc[-1] if den.iloc[-1] != 0 else 0
+    if trend == 'Uptrend':
+        target_level = levels['61.8%']
+        if abs(close_price - target_level) / target_level <= tolerance:
+            signal = 'Buy'
+    elif trend == 'Downtrend':
+        target_level = levels['38.2%']
+        if abs(close_price - target_level) / target_level <= tolerance:
+            signal = 'Sell'
     
-    # Calculate Trailing Stop Adaptive MA
-    df['TS'] = df['SuperTrend']
-    df['Perf_AMA'] = df['TS'].ewm(alpha=perf_idx, adjust=False).mean()
-    
-    # Calculate Bull Market Support Band
-    df = calculate_bull_market_support_band(df)
-    
-    # Generate Signals
-    df = generate_signals(df)
-    
-    # Extract the latest signal
-    latest_signal = df['Signal'].iloc[-1]
-    
-    return latest_signal, df
-
-# -----------------------------
-# Streamlit App
-# -----------------------------
+    return signal
 
 def main():
-    st.title("S&P 500 Trading Strategy Screener")
-    
-    st.sidebar.header("Screening Parameters")
-    
-    # Strategy Settings
-    atr_length = st.sidebar.number_input("ATR Length", min_value=1, value=10)
-    min_mult = st.sidebar.number_input("Factor Range - Min Mult", min_value=0.0, value=1.0, step=0.1)
-    max_mult = st.sidebar.number_input("Factor Range - Max Mult", min_value=0.0, value=5.0, step=0.1)
-    step = st.sidebar.number_input("Factor Step", min_value=0.1, value=0.5, step=0.1)
-    
-    # Validation
-    if min_mult > max_mult:
-        st.sidebar.error("Minimum factor cannot be greater than maximum factor.")
-        st.stop()
-    
-    perf_alpha = st.sidebar.number_input("Performance Memory (perfAlpha)", min_value=2, value=10, step=1)
-    from_cluster = st.sidebar.selectbox("From Cluster", options=["Best", "Average", "Worst"])
-    
-    # Optimization Settings
-    max_iter = st.sidebar.number_input("Maximum Iteration Steps", min_value=1, value=1000, step=100)
-    max_data = st.sidebar.number_input("Historical Bars Calculation", min_value=1, value=1000, step=100)  # Reduced to 1000 for performance
-    
-    # Screening Settings
-    st.sidebar.subheader("Screening Options")
-    signal_filter = st.sidebar.selectbox("Filter by Signal", options=["All", "Buy", "Sell"], index=0)
-    
-    # Fetch S&P 500 tickers
-    st.header("Fetching S&P 500 Tickers...")
-    try:
-        tickers = get_sp500_tickers()
-        st.success(f"Retrieved {len(tickers)} tickers.")
-    except Exception as e:
-        st.error(f"Error fetching tickers: {e}")
-        st.stop()
-    
-    # Date Range
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=365)  # 1 year of data
-    
-    # Progress Indicator
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # Results Storage
-    results = []
-    
-    # Function to process each ticker
-    def process_ticker(ticker):
-        data = fetch_data(ticker, start_date, end_date)
-        if data is None or len(data) < atr_length + 1:
-            return None
-        try:
-            signal, processed_df = apply_trading_strategy(
-                data,
-                atr_length=atr_length,
-                min_mult=min_mult,
-                max_mult=max_mult,
-                step=step,
-                perf_alpha=perf_alpha,
-                from_cluster=from_cluster,
-                max_iter=max_iter,
-                max_data=max_data
-            )
-            return (ticker, signal)
-        except Exception as e:
-            return None
-    
-    # Use ThreadPoolExecutor for concurrent processing
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_ticker = {executor.submit(process_ticker, ticker): ticker for ticker in tickers}
-        total = len(tickers)
-        for idx, future in enumerate(future_to_ticker):
-            ticker = future_to_ticker[future]
-            try:
-                result = future.result()
-                if result:
-                    results.append(result)
-            except Exception as e:
-                pass
-            progress_bar.progress((idx + 1) / total)
-            status_text.text(f"Processing {idx + 1} of {total} tickers...")
-    
-    progress_bar.empty()
-    status_text.empty()
-    
-    # Create DataFrame from results
-    if results:
-        results_df = pd.DataFrame(results, columns=['Ticker', 'Signal'])
-    else:
-        results_df = pd.DataFrame(columns=['Ticker', 'Signal'])
-    
-    # Apply Signal Filter
-    if signal_filter == "Buy":
-        screened_df = results_df[results_df['Signal'] == 1]
-    elif signal_filter == "Sell":
-        screened_df = results_df[results_df['Signal'] == -1]
-    else:
-        screened_df = results_df.copy()
-    
-    screened_df = screened_df.sort_values(by='Signal', ascending=False)
-    
-    st.header("Screening Results")
-    st.write(f"Total Stocks Found: {len(screened_df)}")
-    st.dataframe(screened_df.reset_index(drop=True))
-    
-    # Optional: Visualize Selected Stock
-    if len(screened_df) > 0:
-        selected_ticker = st.selectbox("Select a Ticker to Visualize", options=screened_df['Ticker'].tolist())
-        
-        if selected_ticker:
-            st.subheader(f"Chart for {selected_ticker}")
-            data = fetch_data(selected_ticker, start_date, end_date)
-            if data is not None and len(data) >= atr_length + 1:
-                latest_signal, processed_df = apply_trading_strategy(
-                    data,
-                    atr_length=atr_length,
-                    min_mult=min_mult,
-                    max_mult=max_mult,
-                    step=step,
-                    perf_alpha=perf_alpha,
-                    from_cluster=from_cluster,
-                    max_iter=max_iter,
-                    max_data=max_data
-                )
-                
-                fig = go.Figure()
-        
-                # Price Candles
-                fig.add_trace(go.Candlestick(x=processed_df['Date'],
-                                             open=processed_df['Open'],
-                                             high=processed_df['High'],
-                                             low=processed_df['Low'],
-                                             close=processed_df['Close'],
-                                             name='Price'))
-                
-                # SuperTrend
-                fig.add_trace(go.Scatter(x=processed_df['Date'], y=processed_df['SuperTrend'], 
-                                         line=dict(color='blue', width=1), 
-                                         name='SuperTrend'))
-                
-                # Trailing Stop AMA
-                fig.add_trace(go.Scatter(x=processed_df['Date'], y=processed_df['Perf_AMA'], 
-                                         line=dict(color='purple', width=1, dash='dash'), 
-                                         name='Trailing Stop AMA'))
-                
-                # Bull Market Support Band
-                fig.add_trace(go.Scatter(x=processed_df['Date'], y=processed_df['Weekly_SMA'], 
-                                         line=dict(color='red', width=1), 
-                                         name='20w SMA'))
-                fig.add_trace(go.Scatter(x=processed_df['Date'], y=processed_df['Weekly_EMA'], 
-                                         line=dict(color='green', width=1), 
-                                         name='21w EMA'))
-                fig.add_trace(go.Scatter(x=processed_df['Date'], y=processed_df['Weekly_SMA'],
-                                         fill=None, mode='lines', line=dict(color='orange'), showlegend=False))
-                fig.add_trace(go.Scatter(x=processed_df['Date'], y=processed_df['Weekly_EMA'],
-                                         fill='tonexty', mode='lines', line=dict(color='orange'), 
-                                         name='Support Band'))
-                
-                # Signals
-                buy_signals = processed_df[processed_df['Signal'] == 1]
-                sell_signals = processed_df[processed_df['Signal'] == -1]
-                
-                fig.add_trace(go.Scatter(mode='markers',
-                                         x=buy_signals['Date'],
-                                         y=buy_signals['Low'],
-                                         marker=dict(symbol='triangle-up', color='green', size=10),
-                                         name='Buy Signal'))
-                fig.add_trace(go.Scatter(mode='markers',
-                                         x=sell_signals['Date'],
-                                         y=sell_signals['High'],
-                                         marker=dict(symbol='triangle-down', color='red', size=10),
-                                         name='Sell Signal'))
-                
-                # Update layout
-                fig.update_layout(title=f"{selected_ticker} Trading Strategy",
-                                  yaxis_title="Price",
-                                  xaxis_title="Date",
-                                  xaxis_rangeslider_visible=False,
-                                  template="seaborn")
-                
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.error("Insufficient data to plot the chart.")
-    else:
-        st.info("No stocks matched the selected criteria.")
-    
+    st.set_page_config(page_title="Fibonacci + SuperTrend Screener", layout="wide")
+    st.title("📈 Fibonacci Golden Level + SuperTrend Strategy Screener for S&P 500")
     st.markdown("""
-    ---
-    **Disclaimer:** This screener is for educational purposes only and does not constitute financial advice. Trading involves risk.
+        This application screens S&P 500 stocks based on the combined **Fibonacci Golden Level** and **SuperTrend** strategy.
+        
+        **Strategy Overview**:
+        - **Uptrend**: Identified by SuperTrend indicator.
+        - **Buy Signal**: Price is near the 61.8% Fibonacci retracement level during an uptrend.
+        - **Downtrend**: Identified by SuperTrend indicator.
+        - **Sell Signal**: Price is near the 38.2% Fibonacci retracement level during a downtrend.
     """)
+    
+    if st.button("Run Screener"):
+        with st.spinner("Fetching and processing data..."):
+            tickers = get_sp500_tickers()
+            results = []
+            
+            for ticker in tickers:
+                try:
+                    # Fetch historical data (past 1 year)
+                    df = yf.download(ticker, period='1y', interval='1d', progress=False)
+                    if df.empty:
+                        continue
+                    # Calculate SuperTrend
+                    df = calculate_supertrend(df)
+                    # Apply strategy
+                    signal = apply_strategy(df)
+                    if signal in ['Buy', 'Sell']:
+                        results.append({
+                            'Ticker': ticker,
+                            'Signal': signal,
+                            'Close Price': round(df['Close'].iloc[-1], 2),
+                            'SuperTrend': round(df['SuperTrend'].iloc[-1], 2),
+                            'Trend': 'Uptrend' if signal == 'Buy' else 'Downtrend'
+                        })
+                except Exception as e:
+                    # Handle exceptions (e.g., data fetching issues)
+                    continue
+            
+            if results:
+                result_df = pd.DataFrame(results)
+                result_df = result_df.sort_values(by='Signal', ascending=False)
+                st.success("Screening Complete!")
+                st.write(f"**Found {len(result_df)} stocks matching the criteria:**")
+                
+                # Split the results into Buy and Sell for better visualization
+                buy_df = result_df[result_df['Signal'] == 'Buy']
+                sell_df = result_df[result_df['Signal'] == 'Sell']
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("🔼 Buy Signals")
+                    st.dataframe(buy_df.reset_index(drop=True))
+                
+                with col2:
+                    st.subheader("🔻 Sell Signals")
+                    st.dataframe(sell_df.reset_index(drop=True))
+            else:
+                st.warning("No stocks found matching the criteria.")
+    
+    st.markdown("---")
+    st.markdown("**Disclaimer**: This tool is for educational purposes only and does not constitute financial advice. Always do your own research before making any investment decisions.")
 
 if __name__ == "__main__":
     main()
