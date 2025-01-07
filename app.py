@@ -65,7 +65,7 @@ def screen_sp500_marubozu():
     
     for ticker in tickers:
         try:
-            df = yf.download(ticker, period="2mo", interval="1d", progress=False)
+            df = yf.download(ticker, period="3mo", interval="1d", progress=False)
             
             # If there's not enough data, skip
             if df.shape[0] == 0:
