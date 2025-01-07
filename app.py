@@ -1,39 +1,38 @@
 import streamlit as st
-import requests
 import pandas as pd
+import requests
 import yfinance as yf
 
+# -------------------------
+# 1) HELPER FUNCTIONS
+# -------------------------
 def get_sp500_tickers():
     """
-    Scrapes Wikipedia to retrieve the current list of S&P 500 companies and returns the tickers.
+    Scrapes Wikipedia for the current list of S&P 500 companies and returns the tickers.
     """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     html = requests.get(url).text
+    
     sp500_table = pd.read_html(html, header=0)[0]
     tickers = sp500_table['Symbol'].unique().tolist()
-    # Some tickers contain '.' such as 'BRK.B' on Wikipedia, 
-    # but yfinance expects '-' for those. Replace as needed:
-    tickers = [t.replace(".", "-") for t in tickers]
+    # Replace '.' with '-' for yfinance (e.g. 'BRK.B' -> 'BRK-B')
+    tickers = [t.replace('.', '-') for t in tickers]
     return tickers
 
-def is_white_marubozu_yesterday(df, threshold=0.01):
+def is_white_marubozu(row, threshold=0.01):
     """
-    Determines if yesterday's candle (the second-to-last row) in a DataFrame has a white marubozu.
-    
-    threshold: Float between 0 and 1 indicating the fraction of the day's range 
-               that upper/lower wick can occupy.
+    Checks if a single candle (row) is a White Marubozu:
+      - Close > Open (bullish)
+      - (Open - Low)  < threshold * (High - Low)
+      - (High - Close) < threshold * (High - Low)
+    Returns True/False.
     """
-    # Need at least 2 rows to check "yesterday"
-    if len(df) < 2:
-        return False
+    open_price  = row['Open']
+    close_price = row['Close']
+    high_price  = row['High']
+    low_price   = row['Low']
     
-    candle = df.iloc[-2]  # second-to-last row
-    open_price = candle['Open']
-    high_price = candle['High']
-    low_price = candle['Low']
-    close_price = candle['Close']
-    
-    # Must be a bullish candle
+    # Must be bullish
     if close_price <= open_price:
         return False
     
@@ -41,64 +40,151 @@ def is_white_marubozu_yesterday(df, threshold=0.01):
     if candle_range == 0:
         return False
     
-    # Check if open is near the low
+    # Check lower wick
     if (open_price - low_price) > threshold * candle_range:
         return False
     
-    # Check if close is near the high
+    # Check upper wick
     if (high_price - close_price) > threshold * candle_range:
         return False
     
     return True
 
-def screen_sp500_marubozu_yesterday(threshold=0.01):
+def find_marubozu_in_lookback(df, lookback=1, threshold=0.01):
     """
-    Screens through the S&P 500 for a white Marubozu candlestick on yesterday's candle.
+    Checks if there is ANY White Marubozu candle among the last `lookback` fully-closed candles.
+
+    By default, `lookback=1` => checks ONLY 'yesterday' (the second-to-last row, i.e. df.iloc[-2]).
+    If `lookback=10`, it checks df.iloc[-2] through df.iloc[-(2+lookback-1)], i.e. the 10 most recent
+    fully-closed daily candles.
+
+    Returns True if at least one of those candles is White Marubozu, else False.
+    """
+    # We need at least (lookback + 1) rows because we skip the last row (-1) 
+    # which may be incomplete or "today."
+    if len(df) < (lookback + 1):
+        return False
+    
+    # Check from -2 (yesterday) back to -2 - (lookback-1).
+    start_index = -2
+    end_index = -(2 + lookback - 1)  # inclusive
+
+    for i in range(start_index, end_index - 1, -1):
+        candle = df.iloc[i]
+        if is_white_marubozu(candle, threshold=threshold):
+            return True
+    
+    return False
+
+# -------------------------
+#  2) FIXED SCREEN FUNCTION
+# -------------------------
+def screen_sp500_marubozu_yf(lookback=1, threshold=0.01):
+    """
+    Screens through the S&P 500 for any White Marubozu candles within the specified lookback
+    (defaults to checking just 'yesterday'), but downloads in chunks to avoid the
+    'Cannot join tz-naive with tz-aware DatetimeIndex' error.
+
     Logs progress in the Streamlit app.
     """
-    st.write("Fetching S&P 500 ticker list...")
+    st.write("Fetching S&P 500 tickers...")
     tickers = get_sp500_tickers()
-    st.write(f"Found {len(tickers)} tickers. Starting the screening...")
+    st.write(f"Found {len(tickers)} tickers. Downloading data in batches...")
 
-    marubozu_tickers = []
+    # Helper to create chunks/batches of a list
+    def chunker(seq, size):
+        for pos in range(0, len(seq), size):
+            yield seq[pos : pos + size]
+
+    batch_size = 50  # 50 tickers per batch; adjust as you see fit
+    all_batches = []
+
+    # 1) Download in chunks
+    for chunk in chunker(tickers, batch_size):
+        st.write(f"Downloading batch of size {len(chunk)}: {chunk[:3]}... + others")
+        # Download for this chunk
+        df_chunk = yf.download(
+            chunk,
+            period="3mo",
+            interval="1d",
+            group_by="ticker",
+            progress=False
+        )
+        # 2) Remove timezone from each ticker's index (tz_localize(None)) to unify
+        for t in chunk:
+            try:
+                if not df_chunk[t].empty:
+                    df_chunk[t].index = df_chunk[t].index.tz_localize(None)
+            except Exception as e:
+                st.write(f"Timezone fix error for {t}: {e}")
+        # Store the chunk
+        all_batches.append(df_chunk)
     
-    # Download all tickers in a single call
-    st.write("Downloading data for all tickers (3mo daily bars)...")
-    df = yf.download(
-        tickers, 
-        period="3mo", 
-        interval="1d", 
-        group_by='ticker', 
-        progress=False
-    )
+    # 3) Concatenate all chunked data horizontally
+    try:
+        df_all = pd.concat(all_batches, axis=1)
+    except Exception as e:
+        st.write("Error concatenating batch data:", e)
+        return []
+
+    # 4) Now perform the marubozu screening
+    marubozu_tickers = []
+    st.write(f"Checking the last {lookback} fully-closed candles for each ticker...")
 
     for ticker in tickers:
+        st.write(f"Processing {ticker}...")
         try:
-            st.write(f"Processing {ticker} ...")
-            ticker_df = df[ticker].dropna()
-            
-            if is_white_marubozu_yesterday(ticker_df, threshold=threshold):
-                st.write(f">>> Found White Marubozu (yesterday): {ticker}")
+            df_ticker = df_all[ticker].dropna()
+            if find_marubozu_in_lookback(df_ticker, lookback=lookback, threshold=threshold):
+                st.write(f"**>>> Found White Marubozu in last {lookback} candles: {ticker}**")
                 marubozu_tickers.append(ticker)
         except Exception as e:
-            st.write(f"Error retrieving data for {ticker}: {e}")
-    
+            st.write(f"Error with {ticker}: {e}")
+
     return marubozu_tickers
 
 # -------------------------
-#  STREAMLIT APP LAYOUT
+# 3) STREAMLIT APP
 # -------------------------
-st.title("S&P 500 White Marubozu Screener (Yesterday's Candle)")
+def main():
+    st.title("S&P 500 White Marubozu Screener")
+    st.write(
+        """
+        This tool checks for a White Marubozu candle in the **last N** fully-closed daily bars.  
+        By default, N=1 (i.e., 'yesterday'). Increase N to check more recent days (e.g., last 10).
+        """
+    )
 
-st.write("Click the **Start Screening** button below to fetch S&P 500 stocks and identify any yesterday White Marubozu candles.")
+    lookback = st.number_input(
+        "How many past candles do you want to check?",
+        min_value=1,
+        max_value=30,
+        value=1,   # Default is 1 => 'yesterday'
+        step=1
+    )
 
-if st.button("Start Screening"):
-    marubozu_results = screen_sp500_marubozu_yesterday(threshold=0.01)
-    st.write("#### Screening Complete!")
-    
-    if marubozu_results:
-        st.write("**S&P 500 stocks with yesterday's White Marubozu candles:**")
-        for stock in marubozu_results:
-            st.write(f"- {stock}")
-    else:
-        st.write("No White Marubozu candles found for yesterday.")
+    threshold = st.slider(
+        "Marubozu threshold (fraction of candle range allowed for wicks)",
+        min_value=0.0001,
+        max_value=0.05,
+        value=0.01,
+        step=0.001
+    )
+
+    if st.button("Start Screening"):
+        st.write(f"Scanning for White Marubozu in last {lookback} fully-closed candles...")
+        marubozu_results = screen_sp500_marubozu_yf(lookback=lookback, threshold=threshold)
+        st.write("#### Screening Complete!")
+
+        if marubozu_results:
+            st.write(
+                f"**Found {len(marubozu_results)} tickers with at least one White Marubozu** "
+                f"among the last {lookback} bars:"
+            )
+            for stock in marubozu_results:
+                st.write(f"- {stock}")
+        else:
+            st.write("No White Marubozu candles found in that window.")
+
+if __name__ == "__main__":
+    main()
