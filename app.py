@@ -1,7 +1,11 @@
+import streamlit as st
 import requests
 import pandas as pd
 import yfinance as yf
 
+# -------------------------
+# 1) HELPER FUNCTIONS
+# -------------------------
 def get_sp500_tickers():
     """
     Scrapes Wikipedia to retrieve the current list of S&P 500 companies and returns the tickers.
@@ -26,8 +30,8 @@ def is_white_marubozu(df, threshold=0.01):
     
     A 'white marubozu' is assumed if:
         - Close > Open (bullish candle)
-        - The difference between Open and Low is less than threshold * (High - Low)
-        - The difference between High and Close is less than threshold * (High - Low)
+        - The difference between Open and Low is < threshold * (High - Low)
+        - The difference between High and Close is < threshold * (High - Low)
     """
     if df.empty:
         return False
@@ -56,33 +60,49 @@ def is_white_marubozu(df, threshold=0.01):
     
     return True
 
-def screen_sp500_marubozu():
+def screen_sp500_marubozu(threshold=0.01):
     """
     Screens through the S&P 500 for a white Marubozu candlestick on the latest day.
+    Logs progress in the Streamlit app.
     """
+    st.write("Fetching S&P 500 ticker list...")
     tickers = get_sp500_tickers()
+    st.write(f"Found {len(tickers)} tickers. Starting the screening...")
+
     marubozu_tickers = []
     
     for ticker in tickers:
+        st.write(f"Processing {ticker} ...")
         try:
-            df = yf.download(ticker, period="2mo", interval="1d", progress=False)
+            # Use period="3mo" to avoid yfinance period errors
+            df = yf.download(ticker, period="3mo", interval="1d", progress=False)
             
-            # If there's not enough data, skip
             if df.shape[0] == 0:
+                st.write(f"No data for {ticker}, skipping.")
                 continue
             
-            if is_white_marubozu(df):
+            if is_white_marubozu(df, threshold=threshold):
+                st.write(f">>> Found White Marubozu: {ticker}")
                 marubozu_tickers.append(ticker)
         except Exception as e:
-            # In case of any download error or data parsing error, just skip
-            print(f"Error retrieving data for {ticker}: {e}")
+            st.write(f"Error retrieving data for {ticker}: {e}")
     
     return marubozu_tickers
 
-if __name__ == "__main__":
-    # Run the screening
-    white_marubozu_stocks = screen_sp500_marubozu()
+# -------------------------
+# 2) STREAMLIT APP LAYOUT
+# -------------------------
+st.title("S&P 500 White Marubozu Screener")
+
+st.write("Click the **Start Screening** button below to fetch S&P 500 stocks and identify any last-day White Marubozu candles.")
+
+if st.button("Start Screening"):
+    marubozu_results = screen_sp500_marubozu(threshold=0.01)
+    st.write("#### Screening Complete!")
     
-    print("S&P 500 stocks with last-day White Marubozu candles:")
-    for stock in white_marubozu_stocks:
-        print(stock)
+    if marubozu_results:
+        st.write("**S&P 500 stocks with last-day White Marubozu candles:**")
+        for stock in marubozu_results:
+            st.write(f"- {stock}")
+    else:
+        st.write("No White Marubozu candles found today.")
