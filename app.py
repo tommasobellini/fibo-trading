@@ -53,12 +53,6 @@ def is_white_marubozu(row, threshold=0.01):
 def find_marubozu_in_lookback(df, lookback=1, threshold=0.01):
     """
     Checks if there is ANY White Marubozu candle among the last `lookback` fully-closed candles.
-
-    By default, `lookback=1` => checks ONLY 'yesterday' (the second-to-last row, i.e. df.iloc[-2]).
-    If `lookback=10`, it checks df.iloc[-2] through df.iloc[-(2+lookback-1)], i.e. the 10 most recent
-    fully-closed daily candles.
-
-    Returns True if at least one of those candles is White Marubozu, else False.
     """
     # We need at least (lookback + 1) rows because we skip the last row (-1) 
     # which may be incomplete or "today."
@@ -79,13 +73,11 @@ def find_marubozu_in_lookback(df, lookback=1, threshold=0.01):
 # -------------------------
 #  2) FIXED SCREEN FUNCTION
 # -------------------------
-def screen_sp500_marubozu_yf(lookback=1, threshold=0.01):
+def screen_sp500_marubozu_yf(lookback=1, threshold=0.01, interval="1d"):
     """
     Screens through the S&P 500 for any White Marubozu candles within the specified lookback
-    (defaults to checking just 'yesterday'), but downloads in chunks to avoid the
-    'Cannot join tz-naive with tz-aware DatetimeIndex' error.
-
-    Logs progress in the Streamlit app.
+    (defaults to checking just 'yesterday'), but downloads in chunks.
+    Now accepts an `interval` parameter: "1d", "1wk", or "1mo".
     """
     st.write("Fetching S&P 500 tickers...")
     tickers = get_sp500_tickers()
@@ -105,8 +97,8 @@ def screen_sp500_marubozu_yf(lookback=1, threshold=0.01):
         # Download for this chunk
         df_chunk = yf.download(
             chunk,
-            period="3mo",
-            interval="1d",
+            period="3mo",      # You can adjust the period as you see fit
+            interval=interval, # Use the user-chosen interval here
             group_by="ticker",
             progress=False
         )
@@ -150,11 +142,12 @@ def main():
     st.title("S&P 500 White Marubozu Screener")
     st.write(
         """
-        This tool checks for a White Marubozu candle in the **last N** fully-closed daily bars.  
-        By default, N=1 (i.e., 'yesterday'). Increase N to check more recent days (e.g., last 10).
+        This tool checks for a White Marubozu candle in the **last N** fully-closed bars.  
+        By default, N=1 (i.e., 'yesterday' for daily). Increase N to check more recent bars.
         """
     )
 
+    # 1. Select how many past candles to look back
     lookback = st.number_input(
         "How many past candles do you want to check?",
         min_value=1,
@@ -163,6 +156,7 @@ def main():
         step=1
     )
 
+    # 2. Marubozu wick threshold
     threshold = st.slider(
         "Marubozu threshold (fraction of candle range allowed for wicks)",
         min_value=0.0001,
@@ -170,16 +164,36 @@ def main():
         value=0.01,
         step=0.001
     )
+    
+    # 3. Choose interval: daily (1d), weekly (1wk), monthly (1mo)
+    interval_choice = st.selectbox(
+        "Select Chart Interval",
+        ["Daily", "Weekly", "Monthly"],
+        index=0  # default to Daily
+    )
+    # Map the user's choice to yfinance intervals
+    if interval_choice == "Daily":
+        interval = "1d"
+    elif interval_choice == "Weekly":
+        interval = "1wk"
+    else:
+        interval = "1mo"
 
     if st.button("Start Screening"):
-        st.write(f"Scanning for White Marubozu in last {lookback} fully-closed candles...")
-        marubozu_results = screen_sp500_marubozu_yf(lookback=lookback, threshold=threshold)
+        st.write(
+            f"Scanning for White Marubozu in the last {lookback} fully-closed {interval_choice.lower()} bars..."
+        )
+        marubozu_results = screen_sp500_marubozu_yf(
+            lookback=lookback, 
+            threshold=threshold,
+            interval=interval
+        )
         st.write("#### Screening Complete!")
 
         if marubozu_results:
             st.write(
                 f"**Found {len(marubozu_results)} tickers with at least one White Marubozu** "
-                f"among the last {lookback} bars:"
+                f"among the last {lookback} {interval_choice.lower()} bars:"
             )
             for stock in marubozu_results:
                 st.write(f"- {stock}")
