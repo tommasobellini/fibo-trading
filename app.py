@@ -124,7 +124,6 @@ def screen_sp500_marubozu_yf(lookback=1, threshold=0.01, interval="1d"):
     st.write(f"Checking the last {lookback} fully-closed candles for each ticker...")
 
     for ticker in tickers:
-        st.write(f"Processing {ticker}...")
         try:
             df_ticker = df_all[ticker].dropna()
             if find_marubozu_in_lookback(df_ticker, lookback=lookback, threshold=threshold):
