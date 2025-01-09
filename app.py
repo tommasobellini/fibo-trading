@@ -1,203 +1,372 @@
 import streamlit as st
 import pandas as pd
-import requests
+import numpy as np
 import yfinance as yf
+import datetime
+import ta
 
-# -------------------------
-# 1) HELPER FUNCTIONS
-# -------------------------
-def get_sp500_tickers():
-    """
-    Scrapes Wikipedia for the current list of S&P 500 companies and returns the tickers.
-    """
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    html = requests.get(url).text
-    
-    sp500_table = pd.read_html(html, header=0)[0]
-    tickers = sp500_table['Symbol'].unique().tolist()
-    # Replace '.' with '-' for yfinance (e.g. 'BRK.B' -> 'BRK-B')
-    tickers = [t.replace('.', '-') for t in tickers]
-    return tickers
+# -----------------------------
+# 1) Ticker Universe
+# -----------------------------
+# Sample subset of S&P 500 (you can replace with the full list)
+SP500_TICKERS = [
+    "AAPL", "MSFT", "AMZN", "GOOGL", "TSLA",
+    "JNJ", "XOM", "V", "NVDA", "JPM",  # ... etc.
+]
 
-def is_white_marubozu(row, threshold=0.01):
-    """
-    Checks if a single candle (row) is a White Marubozu:
-      - Close > Open (bullish)
-      - (Open - Low)  < threshold * (High - Low)
-      - (High - Close) < threshold * (High - Low)
-    Returns True/False.
-    """
-    open_price  = row['Open']
-    close_price = row['Close']
-    high_price  = row['High']
-    low_price   = row['Low']
-    
-    # Must be bullish
-    if close_price <= open_price:
-        return False
-    
-    candle_range = high_price - low_price
-    if candle_range == 0:
-        return False
-    
-    # Check lower wick
-    if (open_price - low_price) > threshold * candle_range:
-        return False
-    
-    # Check upper wick
-    if (high_price - close_price) > threshold * candle_range:
-        return False
-    
-    return True
 
-def find_marubozu_in_lookback(df, lookback=1, threshold=0.01):
+# -----------------------------
+# 2) Pivot Calculation
+# -----------------------------
+def pivot_high(series, left_bars, right_bars):
     """
-    Checks if there is ANY White Marubozu candle among the last `lookback` fully-closed candles.
+    Identify pivot highs where 'series' is greater than the left_bars bars to the left
+    and greater than the right_bars bars to the right.
+    Return a boolean Series of the same length as 'series'.
     """
-    # We need at least (lookback + 1) rows because we skip the last row (-1) 
-    # which may be incomplete or "today."
-    if len(df) < (lookback + 1):
-        return False
-    
-    # Check from -2 (yesterday) back to -2 - (lookback-1).
-    start_index = -2
-    end_index = -(2 + lookback - 1)  # inclusive
+    cond = pd.Series([True] * len(series), index=series.index)  # Start as all True, refine below
 
-    for i in range(start_index, end_index - 1, -1):
-        candle = df.iloc[i]
-        if is_white_marubozu(candle, threshold=threshold):
-            return True
-    
-    return False
+    # Compare to left side
+    for i in range(1, left_bars + 1):
+        cond_left = series > series.shift(i)
+        cond = cond & cond_left.fillna(False)
 
-# -------------------------
-#  2) FIXED SCREEN FUNCTION
-# -------------------------
-def screen_sp500_marubozu_yf(lookback=1, threshold=0.01, interval="1d"):
+    # Compare to right side
+    for j in range(1, right_bars + 1):
+        cond_right = series > series.shift(-j)
+        cond = cond & cond_right.fillna(False)
+
+    return cond.fillna(False)
+
+
+def pivot_low(series, left_bars, right_bars):
     """
-    Screens through the S&P 500 for any White Marubozu candles within the specified lookback
-    (defaults to checking just 'yesterday'), but downloads in chunks.
-    Now accepts an `interval` parameter: "1d", "1wk", or "1mo".
+    Identify pivot lows where 'series' is less than the left_bars bars to the left
+    and less than the right_bars bars to the right.
+    Return a boolean Series of the same length as 'series'.
     """
-    st.write("Fetching S&P 500 tickers...")
-    tickers = get_sp500_tickers()
-    st.write(f"Found {len(tickers)} tickers. Downloading data in batches...")
+    cond = pd.Series([True] * len(series), index=series.index)
 
-    # Helper to create chunks/batches of a list
-    def chunker(seq, size):
-        for pos in range(0, len(seq), size):
-            yield seq[pos : pos + size]
+    # Compare to left side
+    for i in range(1, left_bars + 1):
+        cond_left = series < series.shift(i)
+        cond = cond & cond_left.fillna(False)
 
-    batch_size = 50  # 50 tickers per batch; adjust as you see fit
-    all_batches = []
+    # Compare to right side
+    for j in range(1, right_bars + 1):
+        cond_right = series < series.shift(-j)
+        cond = cond & cond_right.fillna(False)
 
-    # 1) Download in chunks
-    for chunk in chunker(tickers, batch_size):
-        st.write(f"Downloading batch of size {len(chunk)}: {chunk[:3]}... + others")
-        # Download for this chunk
-        df_chunk = yf.download(
-            chunk,
-            period="3mo",      # You can adjust the period as you see fit
-            interval=interval, # Use the user-chosen interval here
-            group_by="ticker",
-            progress=False
+    return cond.fillna(False)
+
+
+# -----------------------------
+# 3) Indicator Calculations
+# -----------------------------
+def compute_indicators(df):
+    """
+    Given a DataFrame with columns: ['Open','High','Low','Close','Volume']
+    Return a dict of Series for various indicators.
+    """
+
+    # RSI (14)
+    rsi_14 = ta.momentum.rsi(df['Close'], window=14)
+
+    # MACD
+    macd_inst = ta.trend.MACD(
+        df['Close'],
+        window_slow=26,
+        window_fast=12,
+        window_sign=9
+    )
+    macd_line = macd_inst.macd()          # MACD line
+    macd_signal = macd_inst.macd_signal() # signal line
+    macd_hist = macd_inst.macd_diff()     # histogram
+
+    # Stochastic (14,3)
+    stoch_k = ta.momentum.stoch(
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        window=14,
+        smooth_window=3
+    )
+
+    # CCI (20)
+    cci_20 = ta.trend.cci(
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        window=20
+    )
+
+    # Momentum (10) - simple approach is close.diff(10)
+    # or we can replicate the "mom" logic from Pine (Close - Close[n])
+    momentum_10 = df['Close'] - df['Close'].shift(10)
+
+    # OBV
+    obv_series = ta.volume.on_balance_volume(
+        df['Close'],
+        df['Volume']
+    )
+
+    # CMF (21)
+    cmf_21 = ta.volume.chaikin_money_flow(
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        volume=df['Volume'],
+        window=21
+    )
+
+    # MFI (14)
+    mfi_14 = ta.volume.money_flow_index(
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        volume=df['Volume'],
+        window=14
+    )
+
+    # For demonstration, we'll skip VWmacd replication. You can add it if needed.
+    # Return a dictionary of indicator series
+    return {
+        "rsi": rsi_14,
+        "macd_line": macd_line,
+        "macd_hist": macd_hist,
+        "stoch": stoch_k,
+        "cci": cci_20,
+        "momentum": momentum_10,
+        "obv": obv_series,
+        "cmf": cmf_21,
+        "mfi": mfi_14,
+    }
+
+
+# -----------------------------
+# 4) Divergence Detection
+# -----------------------------
+def detect_divergences(df, indicator, pivot_high_col, pivot_low_col, lookback_bars=100):
+    """
+    Attempt to replicate the logic for:
+      - Positive Regular Divergence (price forms higher low, indicator forms lower low)
+      - Negative Regular Divergence (price forms lower high, indicator forms higher high)
+      - Positive Hidden Divergence (price forms lower low, indicator forms higher low)
+      - Negative Hidden Divergence (price forms higher high, indicator forms lower high)
+
+    Return a dict of boolean arrays for each type:
+      {
+        'positive_regular': [bool, bool, ...],
+        'negative_regular': [...],
+        'positive_hidden':  [...],
+        'negative_hidden':  [...],
+      }
+
+    Simplified approach: we only compare consecutive pivots. 
+    For exact replication of Pine's slope checks & multi-pivot checks, 
+    you must add more advanced logic. 
+    """
+    signals = {
+        'positive_regular': np.zeros(len(df), dtype=bool),
+        'negative_regular': np.zeros(len(df), dtype=bool),
+        'positive_hidden':  np.zeros(len(df), dtype=bool),
+        'negative_hidden':  np.zeros(len(df), dtype=bool),
+    }
+
+    # Identify pivot locations
+    pivot_low_idx = df.index[df[pivot_low_col]]
+    pivot_high_idx = df.index[df[pivot_high_col]]
+
+    # 1) Positive Regular Divergence = 
+    #    Price: Higher Low, Indicator: Lower Low
+    for i in range(1, len(pivot_low_idx)):
+        curr = pivot_low_idx[i]
+        prev = pivot_low_idx[i-1]
+        if (curr - prev).days > lookback_bars:
+            continue
+
+        # Price
+        price_prev = df.loc[prev, 'Close']
+        price_curr = df.loc[curr, 'Close']
+        # Indicator
+        indi_prev = indicator.loc[prev]
+        indi_curr = indicator.loc[curr]
+
+        # Price forms a higher low
+        # Indicator forms a lower low
+        if price_curr > price_prev and indi_curr < indi_prev:
+            signals['positive_regular'][df.index.get_loc(curr)] = True
+
+    # 2) Negative Regular Divergence = 
+    #    Price: Lower High, Indicator: Higher High
+    for i in range(1, len(pivot_high_idx)):
+        curr = pivot_high_idx[i]
+        prev = pivot_high_idx[i-1]
+        if (curr - prev).days > lookback_bars:
+            continue
+
+        # Price
+        price_prev = df.loc[prev, 'Close']
+        price_curr = df.loc[curr, 'Close']
+        # Indicator
+        indi_prev = indicator.loc[prev]
+        indi_curr = indicator.loc[curr]
+
+        # Price forms a lower high
+        # Indicator forms a higher high
+        if price_curr < price_prev and indi_curr > indi_prev:
+            signals['negative_regular'][df.index.get_loc(curr)] = True
+
+    # 3) Positive Hidden Divergence = 
+    #    Price: Lower Low, Indicator: Higher Low
+    #    Typically we use pivot lows for that
+    for i in range(1, len(pivot_low_idx)):
+        curr = pivot_low_idx[i]
+        prev = pivot_low_idx[i-1]
+        if (curr - prev).days > lookback_bars:
+            continue
+
+        price_prev = df.loc[prev, 'Close']
+        price_curr = df.loc[curr, 'Close']
+        indi_prev = indicator.loc[prev]
+        indi_curr = indicator.loc[curr]
+
+        # Price forms a lower low
+        # Indicator forms a higher low
+        if price_curr < price_prev and indi_curr > indi_prev:
+            signals['positive_hidden'][df.index.get_loc(curr)] = True
+
+    # 4) Negative Hidden Divergence = 
+    #    Price: Higher High, Indicator: Lower High
+    #    Typically we use pivot highs for that
+    for i in range(1, len(pivot_high_idx)):
+        curr = pivot_high_idx[i]
+        prev = pivot_high_idx[i-1]
+        if (curr - prev).days > lookback_bars:
+            continue
+
+        price_prev = df.loc[prev, 'Close']
+        price_curr = df.loc[curr, 'Close']
+        indi_prev = indicator.loc[prev]
+        indi_curr = indicator.loc[curr]
+
+        # Price forms a higher high
+        # Indicator forms a lower high
+        if price_curr > price_prev and indi_curr < indi_prev:
+            signals['negative_hidden'][df.index.get_loc(curr)] = True
+
+    return signals
+
+
+def screen_for_divergences(ticker, period="6mo", interval="1d", prd=5, showlimit=1):
+    """
+    1. Download data
+    2. Compute pivot highs & lows
+    3. Compute indicators
+    4. Detect divergences
+    5. Check total divergences on the last bar
+    """
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
+    if df is None or len(df) == 0:
+        return None
+
+    df.dropna(inplace=True)
+    if any(col not in df.columns for col in ["Open","High","Low","Close","Volume"]):
+        return None
+
+    # Calculate pivot columns
+    df["pivot_high"] = pivot_high(df["High"], prd, prd)
+    df["pivot_low"] = pivot_low(df["Low"], prd, prd)
+
+    # Compute indicators
+    inds = compute_indicators(df)
+    all_signals_df = pd.DataFrame(index=df.index)
+
+    # For each indicator, detect divergences
+    for name, indi_series in inds.items():
+        if indi_series.isnull().all():
+            continue
+        signals = detect_divergences(
+            df=df,
+            indicator=indi_series,
+            pivot_high_col="pivot_high",
+            pivot_low_col="pivot_low",
+            lookback_bars=100
         )
-        # 2) Remove timezone from each ticker's index (tz_localize(None)) to unify
-        for t in chunk:
-            try:
-                if not df_chunk[t].empty:
-                    df_chunk[t].index = df_chunk[t].index.tz_localize(None)
-            except Exception as e:
-                st.write(f"Timezone fix error for {t}: {e}")
-        # Store the chunk
-        all_batches.append(df_chunk)
-    
-    # 3) Concatenate all chunked data horizontally
-    try:
-        df_all = pd.concat(all_batches, axis=1)
-    except Exception as e:
-        st.write("Error concatenating batch data:", e)
-        return []
+        # Convert dict of signals to columns
+        for sig_name, arr in signals.items():
+            col = f"{name}_{sig_name}"
+            all_signals_df[col] = arr
 
-    # 4) Now perform the marubozu screening
-    marubozu_tickers = []
-    st.write(f"Checking the last {lookback} fully-closed candles for each ticker...")
+    # Now check how many divergences are present in the most recent bar
+    if len(all_signals_df) == 0:
+        return None
 
-    for ticker in tickers:
-        try:
-            df_ticker = df_all[ticker].dropna()
-            if find_marubozu_in_lookback(df_ticker, lookback=lookback, threshold=threshold):
-                st.write(f"**>>> Found White Marubozu in last {lookback} candles: {ticker}**")
-                marubozu_tickers.append(ticker)
-        except Exception as e:
-            st.write(f"Error with {ticker}: {e}")
+    last_bar_signals = all_signals_df.iloc[-1]
+    total_divergences = last_bar_signals.sum()
 
-    return marubozu_tickers
+    # If total_divergences < showlimit => "No signal" in PineScript style
+    meets_threshold = (total_divergences >= showlimit)
 
-# -------------------------
-# 3) STREAMLIT APP
-# -------------------------
+    result = {
+        "ticker": ticker,
+        "data_points": len(df),
+        "last_bar_date": df.index[-1],
+        "divergences_last_bar": int(total_divergences),
+        "signal": meets_threshold,
+    }
+    return result
+
+
+# -----------------------------
+# 5) Streamlit Front-End
+# -----------------------------
 def main():
-    st.title("S&P 500 White Marubozu Screener")
-    st.write(
-        """
-        This tool checks for a White Marubozu candle in the **last N** fully-closed bars.  
-        By default, N=1 (i.e., 'yesterday' for daily). Increase N to check more recent bars.
-        """
-    )
+    st.title("S&P 500 Divergence Screener (Regular + Hidden)")
 
-    # 1. Select how many past candles to look back
-    lookback = st.number_input(
-        "How many past candles do you want to check?",
-        min_value=1,
-        max_value=30,
-        value=1,   # Default is 1 => 'yesterday'
-        step=1
-    )
+    # Sidebar inputs
+    period = st.sidebar.selectbox("Yahoo Finance Period:", ["3mo","6mo","1y","2y","5y"], index=1)
+    interval = st.sidebar.selectbox("Data Interval:", ["1d","1h","15m"], index=0)
+    prd = st.sidebar.slider("Pivot Period", min_value=2, max_value=10, value=5, step=1)
+    showlimit = st.sidebar.slider("Minimum divergences to flag signal", min_value=1, max_value=5, value=1)
 
-    # 2. Marubozu wick threshold
-    threshold = st.slider(
-        "Marubozu threshold (fraction of candle range allowed for wicks)",
-        min_value=0.0001,
-        max_value=0.05,
-        value=0.01,
-        step=0.001
-    )
-    
-    # 3. Choose interval: daily (1d), weekly (1wk), monthly (1mo)
-    interval_choice = st.selectbox(
-        "Select Chart Interval",
-        ["Daily", "Weekly", "Monthly"],
-        index=0  # default to Daily
-    )
-    # Map the user's choice to yfinance intervals
-    if interval_choice == "Daily":
-        interval = "1d"
-    elif interval_choice == "Weekly":
-        interval = "1wk"
-    else:
-        interval = "1mo"
+    if st.button("Run Screener"):
+        results = []
+        for ticker in SP500_TICKERS:
+            try:
+                out = screen_for_divergences(
+                    ticker=ticker, 
+                    period=period, 
+                    interval=interval,
+                    prd=prd,
+                    showlimit=showlimit
+                )
+                if out is not None:
+                    results.append(out)
+                else:
+                    results.append({
+                        "ticker": ticker,
+                        "data_points": 0,
+                        "last_bar_date": None,
+                        "divergences_last_bar": 0,
+                        "signal": False
+                    })
+            except Exception as e:
+                results.append({
+                    "ticker": ticker,
+                    "data_points": 0,
+                    "last_bar_date": None,
+                    "divergences_last_bar": 0,
+                    "signal": False,
+                    "error": str(e)
+                })
 
-    if st.button("Start Screening"):
-        st.write(
-            f"Scanning for White Marubozu in the last {lookback} fully-closed {interval_choice.lower()} bars..."
-        )
-        marubozu_results = screen_sp500_marubozu_yf(
-            lookback=lookback, 
-            threshold=threshold,
-            interval=interval
-        )
-        st.write("#### Screening Complete!")
-
-        if marubozu_results:
-            st.write(
-                f"**Found {len(marubozu_results)} tickers with at least one White Marubozu** "
-                f"among the last {lookback} {interval_choice.lower()} bars:"
-            )
-            for stock in marubozu_results:
-                st.write(f"- {stock}")
+        if results:
+            df_res = pd.DataFrame(results)
+            st.dataframe(df_res)
         else:
-            st.write("No White Marubozu candles found in that window.")
+            st.write("No results to display.")
+
 
 if __name__ == "__main__":
     main()
