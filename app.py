@@ -1,18 +1,35 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 import yfinance as yf
-import datetime
 import ta
 
 # -----------------------------
-# 1) Ticker Universe
+# 1) Get S&P 500 Tickers (Wikipedia scraping)
 # -----------------------------
-# Sample subset of S&P 500 (you can replace with the full list)
-SP500_TICKERS = [
-    "AAPL", "MSFT", "AMZN", "GOOGL", "TSLA",
-    "JNJ", "XOM", "V", "NVDA", "JPM",  # ... etc.
-]
+@st.cache_data
+def get_sp500_tickers():
+    """
+    Fetch the list of S&P 500 companies from Wikipedia and return as a list.
+    """
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    html = requests.get(url).text
+    tables = pd.read_html(html)
+    # The first table on the page typically has the current S&P 500 constituents
+    df_sp500 = tables[0]
+    # Some symbols contain "." instead of "-", etc. Let's do minimal cleaning.
+    tickers = df_sp500['Symbol'].unique().tolist()
+    # Remove any weird tickers like BF.B or BRK.B if you want (optional).
+    # For simplicity, let's keep them but note that Yahoo's API may expect BRK-B as BRK-B, etc.
+    # We'll do a small replace for any that use periods:
+    cleaned_tickers = []
+    for t in tickers:
+        # E.g. 'BRK.B' -> 'BRK-B'
+        if "." in t:
+            t = t.replace(".", "-")
+        cleaned_tickers.append(t)
+    return cleaned_tickers
 
 
 # -----------------------------
@@ -24,14 +41,14 @@ def pivot_high(series, left_bars, right_bars):
     and greater than the right_bars bars to the right.
     Return a boolean Series of the same length as 'series'.
     """
-    cond = pd.Series([True] * len(series), index=series.index)  # Start as all True, refine below
+    cond = pd.Series([True] * len(series), index=series.index)
 
-    # Compare to left side
+    # Compare to the left
     for i in range(1, left_bars + 1):
         cond_left = series > series.shift(i)
         cond = cond & cond_left.fillna(False)
 
-    # Compare to right side
+    # Compare to the right
     for j in range(1, right_bars + 1):
         cond_right = series > series.shift(-j)
         cond = cond & cond_right.fillna(False)
@@ -47,12 +64,12 @@ def pivot_low(series, left_bars, right_bars):
     """
     cond = pd.Series([True] * len(series), index=series.index)
 
-    # Compare to left side
+    # Compare to the left
     for i in range(1, left_bars + 1):
         cond_left = series < series.shift(i)
         cond = cond & cond_left.fillna(False)
 
-    # Compare to right side
+    # Compare to the right
     for j in range(1, right_bars + 1):
         cond_right = series < series.shift(-j)
         cond = cond & cond_right.fillna(False)
@@ -80,8 +97,7 @@ def compute_indicators(df):
         window_sign=9
     )
     macd_line = macd_inst.macd()          # MACD line
-    macd_signal = macd_inst.macd_signal() # signal line
-    macd_hist = macd_inst.macd_diff()     # histogram
+    macd_hist = macd_inst.macd_diff()     # MACD histogram
 
     # Stochastic (14,3)
     stoch_k = ta.momentum.stoch(
@@ -100,8 +116,7 @@ def compute_indicators(df):
         window=20
     )
 
-    # Momentum (10) - simple approach is close.diff(10)
-    # or we can replicate the "mom" logic from Pine (Close - Close[n])
+    # Momentum (10) - replicate a simple approach: (Close - Close.shift(10))
     momentum_10 = df['Close'] - df['Close'].shift(10)
 
     # OBV
@@ -128,8 +143,6 @@ def compute_indicators(df):
         window=14
     )
 
-    # For demonstration, we'll skip VWmacd replication. You can add it if needed.
-    # Return a dictionary of indicator series
     return {
         "rsi": rsi_14,
         "macd_line": macd_line,
@@ -148,23 +161,14 @@ def compute_indicators(df):
 # -----------------------------
 def detect_divergences(df, indicator, pivot_high_col, pivot_low_col, lookback_bars=100):
     """
-    Attempt to replicate the logic for:
-      - Positive Regular Divergence (price forms higher low, indicator forms lower low)
-      - Negative Regular Divergence (price forms lower high, indicator forms higher high)
-      - Positive Hidden Divergence (price forms lower low, indicator forms higher low)
-      - Negative Hidden Divergence (price forms higher high, indicator forms lower high)
+    Checks for:
+      - Positive Regular  (price forms higher low, indicator forms lower low)
+      - Negative Regular  (price forms lower high, indicator forms higher high)
+      - Positive Hidden   (price forms lower low,  indicator forms higher low)
+      - Negative Hidden   (price forms higher high, indicator forms lower high)
 
-    Return a dict of boolean arrays for each type:
-      {
-        'positive_regular': [bool, bool, ...],
-        'negative_regular': [...],
-        'positive_hidden':  [...],
-        'negative_hidden':  [...],
-      }
-
-    Simplified approach: we only compare consecutive pivots. 
-    For exact replication of Pine's slope checks & multi-pivot checks, 
-    you must add more advanced logic. 
+    Returns a dict of boolean arrays for each type, e.g. signals['positive_regular']
+    is a boolean array indicating where a positive regular divergence was found.
     """
     signals = {
         'positive_regular': np.zeros(len(df), dtype=bool),
@@ -173,15 +177,14 @@ def detect_divergences(df, indicator, pivot_high_col, pivot_low_col, lookback_ba
         'negative_hidden':  np.zeros(len(df), dtype=bool),
     }
 
-    # Identify pivot locations
     pivot_low_idx = df.index[df[pivot_low_col]]
     pivot_high_idx = df.index[df[pivot_high_col]]
 
-    # 1) Positive Regular Divergence = 
-    #    Price: Higher Low, Indicator: Lower Low
+    # Positive Regular Divergence
     for i in range(1, len(pivot_low_idx)):
         curr = pivot_low_idx[i]
         prev = pivot_low_idx[i-1]
+        # Skip if too far apart
         if (curr - prev).days > lookback_bars:
             continue
 
@@ -192,34 +195,27 @@ def detect_divergences(df, indicator, pivot_high_col, pivot_low_col, lookback_ba
         indi_prev = indicator.loc[prev]
         indi_curr = indicator.loc[curr]
 
-        # Price forms a higher low
-        # Indicator forms a lower low
+        # Price forms higher low, indicator forms lower low
         if price_curr > price_prev and indi_curr < indi_prev:
             signals['positive_regular'][df.index.get_loc(curr)] = True
 
-    # 2) Negative Regular Divergence = 
-    #    Price: Lower High, Indicator: Higher High
+    # Negative Regular Divergence
     for i in range(1, len(pivot_high_idx)):
         curr = pivot_high_idx[i]
         prev = pivot_high_idx[i-1]
         if (curr - prev).days > lookback_bars:
             continue
 
-        # Price
         price_prev = df.loc[prev, 'Close']
         price_curr = df.loc[curr, 'Close']
-        # Indicator
         indi_prev = indicator.loc[prev]
         indi_curr = indicator.loc[curr]
 
-        # Price forms a lower high
-        # Indicator forms a higher high
+        # Price forms lower high, indicator forms higher high
         if price_curr < price_prev and indi_curr > indi_prev:
             signals['negative_regular'][df.index.get_loc(curr)] = True
 
-    # 3) Positive Hidden Divergence = 
-    #    Price: Lower Low, Indicator: Higher Low
-    #    Typically we use pivot lows for that
+    # Positive Hidden Divergence
     for i in range(1, len(pivot_low_idx)):
         curr = pivot_low_idx[i]
         prev = pivot_low_idx[i-1]
@@ -231,14 +227,11 @@ def detect_divergences(df, indicator, pivot_high_col, pivot_low_col, lookback_ba
         indi_prev = indicator.loc[prev]
         indi_curr = indicator.loc[curr]
 
-        # Price forms a lower low
-        # Indicator forms a higher low
+        # Price forms lower low, indicator forms higher low
         if price_curr < price_prev and indi_curr > indi_prev:
             signals['positive_hidden'][df.index.get_loc(curr)] = True
 
-    # 4) Negative Hidden Divergence = 
-    #    Price: Higher High, Indicator: Lower High
-    #    Typically we use pivot highs for that
+    # Negative Hidden Divergence
     for i in range(1, len(pivot_high_idx)):
         curr = pivot_high_idx[i]
         prev = pivot_high_idx[i-1]
@@ -250,8 +243,7 @@ def detect_divergences(df, indicator, pivot_high_col, pivot_low_col, lookback_ba
         indi_prev = indicator.loc[prev]
         indi_curr = indicator.loc[curr]
 
-        # Price forms a higher high
-        # Indicator forms a lower high
+        # Price forms higher high, indicator forms lower high
         if price_curr > price_prev and indi_curr < indi_prev:
             signals['negative_hidden'][df.index.get_loc(curr)] = True
 
@@ -260,7 +252,7 @@ def detect_divergences(df, indicator, pivot_high_col, pivot_low_col, lookback_ba
 
 def screen_for_divergences(ticker, period="6mo", interval="1d", prd=5, showlimit=1):
     """
-    1. Download data
+    1. Download data from yfinance
     2. Compute pivot highs & lows
     3. Compute indicators
     4. Detect divergences
@@ -274,15 +266,15 @@ def screen_for_divergences(ticker, period="6mo", interval="1d", prd=5, showlimit
     if any(col not in df.columns for col in ["Open","High","Low","Close","Volume"]):
         return None
 
-    # Calculate pivot columns
+    # Pivot columns
     df["pivot_high"] = pivot_high(df["High"], prd, prd)
-    df["pivot_low"] = pivot_low(df["Low"], prd, prd)
+    df["pivot_low"]  = pivot_low(df["Low"],  prd, prd)
 
-    # Compute indicators
+    # Indicators
     inds = compute_indicators(df)
-    all_signals_df = pd.DataFrame(index=df.index)
 
-    # For each indicator, detect divergences
+    # Gather signals into a DataFrame
+    all_signals_df = pd.DataFrame(index=df.index)
     for name, indi_series in inds.items():
         if indi_series.isnull().all():
             continue
@@ -293,19 +285,16 @@ def screen_for_divergences(ticker, period="6mo", interval="1d", prd=5, showlimit
             pivot_low_col="pivot_low",
             lookback_bars=100
         )
-        # Convert dict of signals to columns
         for sig_name, arr in signals.items():
             col = f"{name}_{sig_name}"
             all_signals_df[col] = arr
 
-    # Now check how many divergences are present in the most recent bar
     if len(all_signals_df) == 0:
         return None
 
+    # Count divergences in the last bar
     last_bar_signals = all_signals_df.iloc[-1]
     total_divergences = last_bar_signals.sum()
-
-    # If total_divergences < showlimit => "No signal" in PineScript style
     meets_threshold = (total_divergences >= showlimit)
 
     result = {
@@ -319,24 +308,26 @@ def screen_for_divergences(ticker, period="6mo", interval="1d", prd=5, showlimit
 
 
 # -----------------------------
-# 5) Streamlit Front-End
+# 5) Streamlit App
 # -----------------------------
 def main():
-    st.title("S&P 500 Divergence Screener (Regular + Hidden)")
+    st.title("Full S&P 500 Divergence Screener")
+    st.write("Scrapes current S&P 500 constituents from Wikipedia, then analyzes all for divergences.")
 
-    # Sidebar inputs
     period = st.sidebar.selectbox("Yahoo Finance Period:", ["3mo","6mo","1y","2y","5y"], index=1)
     interval = st.sidebar.selectbox("Data Interval:", ["1d","1h","15m"], index=0)
-    prd = st.sidebar.slider("Pivot Period", min_value=2, max_value=10, value=5, step=1)
-    showlimit = st.sidebar.slider("Minimum divergences to flag signal", min_value=1, max_value=5, value=1)
+    prd = st.sidebar.slider("Pivot Period (prd)", min_value=2, max_value=10, value=5, step=1)
+    showlimit = st.sidebar.slider("Minimum divergences on last bar to flag signal", min_value=1, max_value=5, value=1)
 
     if st.button("Run Screener"):
+        tickers = get_sp500_tickers()
         results = []
-        for ticker in SP500_TICKERS:
+
+        for ticker in tickers:
             try:
                 out = screen_for_divergences(
-                    ticker=ticker, 
-                    period=period, 
+                    ticker=ticker,
+                    period=period,
                     interval=interval,
                     prd=prd,
                     showlimit=showlimit
@@ -344,6 +335,7 @@ def main():
                 if out is not None:
                     results.append(out)
                 else:
+                    # If no data, or error in retrieval
                     results.append({
                         "ticker": ticker,
                         "data_points": 0,
@@ -363,6 +355,7 @@ def main():
 
         if results:
             df_res = pd.DataFrame(results)
+            st.write(f"**Analyzed {len(tickers)} tickers.**")
             st.dataframe(df_res)
         else:
             st.write("No results to display.")
