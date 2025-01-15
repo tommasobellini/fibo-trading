@@ -132,6 +132,7 @@ tokenizers==0.19.1
 toml==0.10.2
 tornado==6.4.2
 tqdm==4.66.5
+tradingview-ta==3.3.0
 traitlets==5.14.3
 transformers==4.44.2
 typing_extensions==4.12.2
