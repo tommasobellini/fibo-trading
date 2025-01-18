@@ -1,6 +1,10 @@
 absl-py==2.1.0
+aiohappyeyeballs==2.4.4
+aiohttp==3.11.11
+aiosignal==1.3.2
 altair==5.5.0
 annotated-types==0.7.0
+antlr4-python3-runtime==4.13.2
 anyio==4.7.0
 appdirs==1.4.4
 asttokens==3.0.0
@@ -28,10 +32,12 @@ feedparser==6.0.11
 filelock==3.15.4
 financedatabase==2.2.2
 financetoolkit==1.9.5
+finviz==1.4.6
 finvizfinance==1.0.1
 flatbuffers==24.3.25
 fonttools==4.53.1
 frozendict==2.4.4
+frozenlist==1.5.0
 fsspec==2024.6.1
 fundamentalanalysis==0.3.1
 gast==0.6.0
@@ -66,6 +72,7 @@ MarkupSafe==2.1.5
 matplotlib==3.9.2
 mdurl==0.1.2
 ml-dtypes==0.4.0
+multidict==6.1.0
 multitasking==0.0.11
 namex==0.0.8
 narwhals==1.19.1
@@ -87,6 +94,7 @@ pillow==10.4.0
 platformdirs==4.2.2
 plotly==5.24.1
 prompt_toolkit==3.0.48
+propcache==0.2.1
 protobuf==4.25.4
 pure_eval==0.2.3
 pyahocorasick==2.1.0
@@ -96,6 +104,7 @@ pydantic_core==2.27.2
 pydeck==0.9.1
 pyee==11.1.1
 Pygments==2.18.0
+pynescript==0.2.0
 pyparsing==3.1.4
 pyppeteer==2.0.0
 pyquery==2.0.1
@@ -138,6 +147,7 @@ transformers==4.44.2
 typing_extensions==4.12.2
 tzdata==2024.1
 urllib3==1.26.20
+user_agent==0.1.10
 w3lib==2.2.1
 watchdog==6.0.0
 wcwidth==0.2.13
@@ -149,5 +159,6 @@ widgetsnbextension==4.0.13
 wrapt==1.16.0
 xarray==2024.7.0
 yahoo-fin==0.8.9.1
+yarl==1.18.3
 yfinance==0.2.43
 zipp==3.21.0
